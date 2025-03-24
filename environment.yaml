@@ -1,0 +1,17 @@
+name: pinn_gpu_env
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - cudatoolkit=11.8
+  - cudnn=8.4
+  - matplotlib
+  - numpy
+  - scipy
+  - pip:
+      - jax[cuda11_cudnn82] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      - equinox
+      - optax
