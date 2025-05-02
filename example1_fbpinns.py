@@ -1,186 +1,209 @@
-import os
 import jax
 import jax.numpy as jnp
-import jax.random as jr
-import equinox as eqx
 import optax
-import matplotlib.pyplot as plt
+import equinox as eqx
 
-# ----------------------------------
-# 1. 超参数
-# ----------------------------------
-N_SUBDOMAINS = 2             # 子域个数(可根据需求修改)
-N_COLLOCATION_POINTS = 1000  # 每个子域的训练点数
-LEARNING_RATE = 1e-3
-N_OPTIMIZATION_EPOCHS = 20000
+def make_subdomain_batches(model, collocation_points):
+    """
+    根据每个子网的窗口函数，给每个子网筛选一批 collocation points。
+    """
+    subdomain_batches = []
 
-key = jr.PRNGKey(42)
+    for i in range(model.num_subdomains):
+        w = model.subdomain_window(i, collocation_points)  # 获取子域的窗口权重
+        mask = w > 1e-5  # 只取窗口权重大于阈值的点
+        pts = collocation_points[mask]  # 筛选出权重大于阈值的点
+        subdomain_batches.append(pts)
 
-# 定义区间 [0,8]，每个子域长度:
-delta = 8.0 / N_SUBDOMAINS
+    return subdomain_batches
 
-# ----------------------------------
-# 2. PDE定义 + 精确解
-# ----------------------------------
-def phi(x):
-    return (jnp.pi / 4.0) * x**2
 
-def u_exact(x):
-    return jnp.sin(phi(x))
+@eqx.filter_value_and_grad
+def loss_fn(model, subdomain_batches, omega):
+    """
+    Loss是所有子网loss加起来（pde residual loss）。
+    每个子网只负责自己局部的点。
+    """
+    total_loss = 0.0
 
-def f_pde(x):
-    # 对应于: d^2u/dx^2 + f_pde(x) = 0，(这里可能要根据你自己的 PDE 修改)
-    return (jnp.pi**2 / 4.0) * x**2 * jnp.sin(phi(x)) - (jnp.pi / 2.0) * jnp.cos(phi(x))
+    for i in range(model.num_subdomains):
+        x_i = subdomain_batches[i]
+        if len(x_i) == 0:
+            continue
 
-# ----------------------------------
-# 3. 定义子网络 (FBPINN)
-# ----------------------------------
-class FBPINN(eqx.Module):
-    subnets: tuple
+        # 定义子域 i 的 u(x)
+        def u_func(x):
+            return model.subdomain_pred(i, x).squeeze()  # shape (,) for scalar output
 
-    def __init__(self, n_subdomains: int, key):
-        keys = jr.split(key, n_subdomains)
-        self.subnets = tuple(
-            eqx.nn.MLP(
-                in_size=1, out_size=1, width_size=20, depth=3,
-                activation=jax.nn.tanh, key=keys[i]
-            )
-            for i in range(n_subdomains)
-        )
+        # 求导
+        dudx = jax.vmap(jax.grad(u_func))(x_i)
 
-# ----------------------------------
-# 4. Window Function + PINN解拼接
-# ----------------------------------
-def window_function(x, i):
-    """定义用于拼接子域输出的窗口函数。"""
-    A = 30.0
-    centers = jnp.linspace(0, 8, N_SUBDOMAINS)
-    widths = delta * 2
-    # 指定子域 i 的 Gauss 窗口
-    w_i = jnp.exp(-A * (x - centers[i])**2 / widths**2)
-    # 对所有子域窗口作归一化
-    total_w = sum(
-        jnp.exp(-A * (x - centers[j])**2 / widths**2)
-        for j in range(N_SUBDOMAINS)
-    )
-    return w_i / total_w
+        # 计算残差（比如这里是u'(x) = cos(omega x)）
+        residual = dudx - jnp.cos(omega * x_i)
+
+        total_loss += jnp.mean(residual**2)
+
+    return total_loss
+
 
 @eqx.filter_jit
-def net_eval(net, x):
+def train_step(model, opt_state, subdomain_batches, optimizer, omega):
     """
-    原始错误是使用 eqx.filter_eval_shape(...) 得到的仅是 shape placeholder，
-    这里直接使用 net(x) 得到实际输出。
+    单步训练：计算pde残差loss，更新参数。
     """
-    x = jnp.atleast_1d(x).reshape(-1, 1)  # 确保 x 是 [batch, 1] 形式
-    return net(x)[0, 0]  # 返回标量
+    loss, grads = loss_fn(model, subdomain_batches, omega)
+    updates, opt_state = optimizer.update(grads, opt_state, model)
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, loss
 
-def pinn_solution(x, net):
-    """
-    每个子域自身的 PINN 形式，可以根据边界条件或 PDE 特点进行修正。
-    这里以 x*(8 - x)*网络输出 为例，保证边界 x=0/8 处解为 0。
-    """
-    return (x * (8.0 - x)) * net_eval(net, x)
 
-def u_hat(x, params):
+def train_fbpinn(model, collocation_points, omega, batch_size=32, steps=10000, lr=1e-3, x_test=None, u_exact_fn=None):
     """
-    最终拼接：对每个子网络输出加权求和。
+    真正的训练主程序，loss基于pde残差。
+    现在支持：每次print时也计算test的L1误差。
     """
-    return sum(
-        window_function(x, i) * pinn_solution(x, net_i)
-        for i, net_i in enumerate(params.subnets)
+    optimizer = optax.adam(lr)
+    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+
+    loss_list = []
+    l1_list = []
+    l1_steps = []
+
+    for step in range(steps):
+        # 每次从collocation_points中随机选取一个batch
+        key = jax.random.PRNGKey(step)
+        shuffle_idx = jax.random.permutation(key, len(collocation_points))
+        
+        # 获取一个小批量（batch_size）
+        batch_idx = shuffle_idx[:batch_size]
+        batch_points = collocation_points[batch_idx]
+
+        # 重建子网的batch
+        subdomain_batches = make_subdomain_batches(model, batch_points)
+
+        # 训练一步
+        model, opt_state, loss = train_step(model, opt_state, subdomain_batches, optimizer, omega)
+        loss_list.append(float(loss))
+
+        # 每500步或最后一步，打印+计算test L1
+        if step % 100 == 0 or step == steps - 1:
+            if x_test is not None and u_exact_fn is not None:
+                u_pred = inference(model, x_test)
+                u_true = u_exact_fn(x_test)
+                l1_error = jnp.mean(jnp.abs(u_pred - u_true))
+                l1_list.append(float(l1_error))
+                l1_steps.append(step)
+                print(f"Step {step}, Loss={loss:.4e}, Test L1 Error={l1_error:.4e}")
+            else:
+                print(f"Step {step}, Loss={loss:.4e}")
+
+    return model, jnp.array(loss_list), (jnp.array(l1_steps), jnp.array(l1_list))
+
+
+
+def inference(model, x):
+    """
+    推理阶段，所有子网输出乘窗口再加权归一化。
+    相当于： u(x) = sum_i w_i(x) * u_i(x) / sum_i w_i(x)
+    """
+    u_total = 0.0
+    w_total = 0.0
+
+    for i in range(model.num_subdomains):
+        out = model.subdomain_pred(i, x)  # 每个子网的预测输出
+        w = model.subdomain_window(i, x)  # 每个子网的窗口权重
+        u_total += out * w
+        w_total += w
+
+    return u_total / (w_total + 1e-8)  # 防止除以0
+
+
+if __name__ == "__main__":
+    from model.fbpinn_model import FBPINN
+    from physics.pde_cosine import ansatz, u_exact
+    import math
+    # Initialization
+    mlp_config = {
+        "in_size": 1,
+        "out_size": 1,
+        "width_size": 16,
+        "depth": 2,
+        "activation": jax.nn.tanh
+    }
+    
+    domain = (-2 * math.pi, 2 * math.pi)
+
+    n_sub = 5
+    overlap = 4
+    steps = 3000
+    lr = 1e-3
+    n_points_per_subdomain = 20
+
+    # We can define the subdomain list manually here!
+    total_len = domain[1] - domain[0]
+    step_size = total_len / n_sub
+    width = step_size + overlap
+
+    centers = jnp.linspace(domain[0] + step_size / 2,
+                           domain[1] - step_size / 2,
+                           n_sub)
+    # subdomains_list = [ (left_i, right_i), ... ] a tuple list!
+    subdomains_list = []
+    for i in range(n_sub):
+        left = float(centers[i] - width / 2)
+        right = float(centers[i] + width / 2)
+        subdomains_list.append((left, right))
+        
+    model = FBPINN(
+        key=jax.random.PRNGKey(0),
+        num_subdomains=5,
+        ansatz=ansatz,
+        subdomains=subdomains_list,
+        mlp_config=mlp_config
     )
 
-# ----------------------------------
-# 5. PDE 残差 + 损失函数
-# ----------------------------------
-def pde_residual(x, net):
-    """
-    PDE: d^2u/dx^2 + f_pde(x) = 0
-    """
-    # 先计算 du/dx，再二次求导 d2u/dx^2
-    dudx = jax.grad(lambda xx: pinn_solution(xx, net))(x)
-    d2udx2 = jax.grad(lambda xx: dudx)(x)
-    # PDE 残差
-    return d2udx2 + f_pde(x)
+    # collocation points
+    domain = (-2 * jnp.pi, 2 * jnp.pi)
+    key = jax.random.PRNGKey(42)
+    collocation_points = jax.random.uniform(key, (300,), minval=domain[0], maxval=domain[1])
 
-def loss_fn(params, sub_colloc_points):
-    # 1) PDE 残差项
-    loss_pde = sum(
-        jnp.mean(jax.vmap(lambda xx: pde_residual(xx, net))(x_i) ** 2)
-        for net, x_i in zip(params.subnets, sub_colloc_points)
+    # PDE参数，比如 cos(omega x)
+    omega = 1.0
+    x_test = jnp.linspace(domain[0], domain[1], 300)
+    # 开始训练
+    model, losses, (test_steps, test_l1_errors) = train_fbpinn(
+        model,
+        collocation_points,
+        omega=omega,
+        batch_size=32,
+        steps=30000,
+        lr=1e-3,
+        x_test=x_test,
+        u_exact_fn=u_exact
     )
-    # 2) 边界条件损失 (u(0)=0, u(8)=0)
-    loss_bc = u_hat(0.0, params)**2 + u_hat(8.0, params)**2
 
-    return loss_pde + loss_bc
+    # 推理
+    u_pred = inference(model, x_test)
 
-# ----------------------------------
-# 6. 训练初始化
-# ----------------------------------
-model = FBPINN(N_SUBDOMAINS, key)
-optimizer = optax.adam(LEARNING_RATE)
-# 这里 eqx.filter(model, eqx.is_array) 就只获取数值权重(不包含其他 Python 对象)做优化
-opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    # 计算真解
+    u_true = u_exact(x_test)
 
-# 为每个子域分别采 collocation points
-sampling_key = jr.PRNGKey(999)
-all_colloc_points = [
-    jr.uniform(jr.fold_in(sampling_key, i), (N_COLLOCATION_POINTS,),
-               minval=i * delta, maxval=(i + 1) * delta)
-    for i in range(N_SUBDOMAINS)
-]
+    # 比较误差，比如L2误差或者L1误差
+    l2_error = jnp.mean((u_pred - u_true)**2)
+    l1_error = jnp.mean(jnp.abs(u_pred - u_true))
 
-@eqx.filter_jit
-def train_step(params, opt_state, sub_colloc_points):
-    loss_val, grads = eqx.filter_value_and_grad(loss_fn)(params, sub_colloc_points)
-    updates, opt_state = optimizer.update(grads, opt_state, params)
-    params = eqx.apply_updates(params, updates)
-    return params, opt_state, loss_val
+    print(f"L2 error = {l2_error:.4e}")
+    print(f"L1 error = {l1_error:.4e}")
+    import matplotlib.pyplot as plt
 
-# ----------------------------------
-# 7. 训练循环
-# ----------------------------------
-loss_history = []
-for it in range(N_OPTIMIZATION_EPOCHS):
-    model, opt_state, loss_val = train_step(model, opt_state, all_colloc_points)
-
-    if it % 2000 == 0:
-        print(f"Iter={it}, loss={loss_val}")
-    loss_history.append(loss_val)
-
-# ----------------------------------
-# 8. 可视化与误差计算
-# ----------------------------------
-os.makedirs("figures_subdomain", exist_ok=True)
-
-x_plot = jnp.linspace(0.0, 8.0, 400)
-u_pred = jax.vmap(lambda x: u_hat(x, model))(x_plot)
-u_ref = u_exact(x_plot)
-
-l1_error = jnp.mean(jnp.abs(u_pred - u_ref))
-print(f"L1 Error: {l1_error:.6f}")
-
-# 解曲线对比
-plt.figure(figsize=(8, 5))
-plt.plot(x_plot, u_ref, "--", label="Exact Solution")
-plt.plot(x_plot, u_pred, label="FBPINN Solution")
-plt.legend()
-plt.grid(True)
-plt.xlabel("x")
-plt.ylabel("u(x)")
-plt.title(f"FBPINN 1D PDE [0,8] - L1 Error: {l1_error:.6f}")
-plt.savefig("figures_subdomain/solution.png", dpi=300)
-plt.close()
-
-# 损失曲线
-plt.figure()
-plt.plot(loss_history, label="Training Loss")
-plt.yscale("log")
-plt.xlabel("Iteration")
-plt.ylabel("Loss")
-plt.title("Training Loss")
-plt.legend()
-plt.savefig("figures_subdomain/training_loss.png", dpi=300)
-plt.close()
-
-print("Done. Plots saved in figures_subdomain")
+    # 画图：模型预测 vs 真解
+    plt.figure(figsize=(8,5))
+    plt.plot(x_test, u_true, label="Exact $u(x)$", linestyle='--')
+    plt.plot(x_test, u_pred, label="Predicted $\hat{u}(x)$", linewidth=2)
+    plt.xlabel("x")
+    plt.ylabel("u(x)")
+    plt.legend()
+    plt.title(f"FBPINN Prediction vs Exact\nL2 error={l2_error:.2e}, L1 error={l1_error:.2e}")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()

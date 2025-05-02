@@ -1,0 +1,29 @@
+# config/fbpinn.yaml
+# choose the model
+model_type: "fbpinn"  # pinn/fbpinn
+
+# choose the problem
+pde: "problems.CosineODE"   # which physics module, define the problem in physics/problem.py
+# training config
+training:
+  steps: 50000
+  lr: 0.001
+  n_sub: 20
+  overlap: 0.5
+  n_points_per_subdomain: 100
+  checkpoint_every: None
+# --- mini-batch param, only for pinn, not necessary for fbpinn ---
+  batch_strategy: "fixed" # fixed/equal
+  batch_size: 1000     
+  shuffle: true           # shuffle every epoch
+
+mlp:
+  in_size: 1
+  out_size: 1
+  width_size: 16
+  depth: 2
+  activation: "tanh"   
+
+save:
+  output_dir: "outputs/outputs_cosineode"
+  checkpoint_every: 5000

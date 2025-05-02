@@ -1,42 +1,105 @@
-from config import *
-from model.pinn_model import PINN
-from model.fbpinn_model import SmoothFBPINN
-from train.trainer_single import train_single
-from train.trainer_fbpinn import train_fbpinn
-from utils.visualizer import plot_loss_compare, plot_solution_compare, plot_window_functions
-from physics.pde_1d import u_exact
-import jax
-import jax.random as jr
-import jax.numpy as jnp
-import os
+# main.py ────────────────────────────────────────────────
+"""
+统一入口：读取 YAML 配置，构建问题 → 构建模型 → 训练 → 可视化
+用法:
+    python main.py --cfg config/run.yaml
+"""
+import argparse, importlib, yaml
+from pathlib import Path
+import jax, jax.numpy as jnp
 
-os.makedirs("outputs/figures", exist_ok=True)
+# ────────────────────── CLI ──────────────────────
+ap = argparse.ArgumentParser()
+ap.add_argument("--cfg", default="config/run.yaml", help="YAML 配置文件路径")
+CFG = yaml.safe_load(Path(ap.parse_args().cfg).read_text())
 
-# ---- 采样点
-sampling_key = jr.PRNGKey(0)
-x_collocation = jr.uniform(sampling_key, (n_collocation,), minval=domain_min, maxval=domain_max)
+# ─────────────── 加载 PDEProblem 子类 ─────────────
+mod_path, cls_name = CFG["pde"].rsplit(".", 1)
+ProbCls = getattr(importlib.import_module(f"physics.{mod_path}"), cls_name)
+prob      = ProbCls()
+DOMAIN    = prob.domain           # (x_min, x_max)
+RESIDUAL  = prob.residual         # PDE 残差函数
 
-# ---- 分割子域
-subdomains = [(i * 2.0, (i + 1) * 2.0) for i in range(n_subdomains)]
-x_subsets = [x_collocation[(x_collocation >= a) & (x_collocation < b)] for a, b in subdomains]
+# ─────────────── MLP 配置字典 ───────────────
+act_map = {"tanh": jax.nn.tanh, "relu": jax.nn.relu,
+           "gelu": jax.nn.gelu, "sigmoid": jax.nn.sigmoid}
+mlp_cfg = dict(CFG["mlp"])
+mlp_cfg["activation"] = act_map[mlp_cfg["activation"]]
 
-# ---- 训练 FBPINN
-fb_model = SmoothFBPINN(subdomains, sigma_val, jr.PRNGKey(2022))
-fb_model, fb_loss = train_fbpinn(fb_model, x_subsets, n_steps, learning_rate)
+key = jax.random.PRNGKey(0)
 
-# ---- 训练 Single PINN
-single_model = PINN(jr.PRNGKey(42))
-single_model, single_loss = train_single(single_model, x_collocation, learning_rate, n_steps)
+# ─────────────── 构建模型 & collocation ───────────────
+if CFG["model_type"].lower() == "fbpinn":
+    from model.fbpinn_model import FBPINN
+    from utils.data_utils   import generate_subdomain, generate_collocation_points
 
-# ---- 可视化 Loss 对比
-plot_loss_compare(single_loss, fb_loss, "outputs/figures/loss_compare.png")
+    n_sub   = CFG["training"]["n_sub"]  # number of subdomains
+    overlap = CFG["training"]["overlap"] # param. for overlap of window functions
+    subs    = generate_subdomain(DOMAIN, n_sub, overlap) # generate subdomains
 
-# ---- 计算预测误差
-x_eval = jnp.linspace(domain_min, domain_max, 300)
-fb_pred = jax.vmap(fb_model)(x_eval)
-pinn_pred = jax.vmap(single_model)(x_eval)
-u_true = u_exact(x_eval)
+    model   = FBPINN(key, n_sub, prob.ansatz, subs, mlp_cfg) 
 
-# ---- 可视化解对比 + 窗口函数
-plot_solution_compare(x_eval, pinn_pred, fb_pred, u_true, "outputs/figures/solution_compare.png")
-plot_window_functions(x_eval, subdomains, sigma_val, "outputs/figures/window_functions.png")
+    n_pts   = CFG["training"]["n_points_per_subdomain"]
+    colloc, _ = generate_collocation_points(
+        domain=DOMAIN, subdomains_list=subs,
+        n_points_per_subdomain=n_pts, seed=0
+    )                                       # list[n_sub] -> full-batch
+    trainer_mod = "train.trainer_fbpinn"
+else:
+    from model.pinn_model import PINN
+    model = PINN(key, prob.ansatz,
+                 width=mlp_cfg["width_size"], depth=mlp_cfg["depth"])
+
+    total   = CFG["training"]["n_sub"] * CFG["training"]["n_points_per_subdomain"]
+    colloc  = jnp.linspace(*DOMAIN, total)             # (N,)
+    trainer_mod = "train.trainer_single"
+
+# ─────────────── 训练 ───────────────
+TrainMod = importlib.import_module(trainer_mod)
+train_fn = getattr(TrainMod, "train_fbpinn" if trainer_mod.endswith("fbpinn")
+                                else "train_single")
+
+steps, lr = CFG["training"]["steps"], CFG["training"]["lr"]
+out_dir   = Path(CFG["save"]["output_dir"]).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+if trainer_mod.endswith("fbpinn"):
+    # FBPINN 
+    model, loss_hist, (t_steps, t_l1) = train_fn(
+        model                       = model,
+        subdomain_collocation_points= colloc,
+        steps                       = steps,
+        lr                          = lr,
+        pde_residual_loss           = RESIDUAL,
+        x_test                      = jnp.linspace(*DOMAIN, 300),
+        u_exact                     = prob.exact,
+        save_dir                    = str(out_dir),
+        checkpoint_every            = CFG["save"].get("checkpoint_every", 0)
+    )
+else:
+    # PINN –> 仍然可 mini-batch
+    model, loss_hist, t_l1 = train_fn(
+        model, colloc, lr, steps,
+        RESIDUAL, jnp.linspace(*DOMAIN, 300), prob.exact,
+        batch_size=CFG["training"]["batch_size"]
+    )
+    t_steps = jnp.arange(len(t_l1))
+
+# ─────────────── 可视化 & 保存 ───────────────
+from utils.visualizer import (
+    plot_prediction_vs_exact, plot_training_loss, plot_test_l1_curve,
+    plot_window_weights, plot_subdomain_partials, save_training_stats)
+
+x = jnp.linspace(*DOMAIN, 500)
+u_pred, u_true = jax.vmap(model)(x), prob.exact(x)
+
+plot_prediction_vs_exact(x, u_true, u_pred, out_dir)
+plot_training_loss(loss_hist, out_dir)
+plot_test_l1_curve(t_steps, t_l1, out_dir)
+
+if trainer_mod.endswith("fbpinn"):
+    plot_window_weights(x, subs, len(subs), out_dir)
+    plot_subdomain_partials(model, x, u_true, out_dir)
+
+save_training_stats(loss_hist, t_steps, t_l1, out_dir)
+print(f"✓ Done. Results saved to {out_dir}")

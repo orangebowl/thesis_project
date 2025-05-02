@@ -9,8 +9,9 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 def loss_fn(model, x_collocation, pde_residual):
-    residuals = jax.vmap(lambda x: pde_residual(model, x))(x_collocation)
-    return jnp.mean(residuals ** 2)
+    # 这里已经是一整个批次，不需要再 vmap
+    return pde_residual(model, x_collocation)
+
 
 @eqx.filter_jit
 def train_step_single(model, opt_state, x_collocation, optimizer, pde_residual):
@@ -45,8 +46,10 @@ def train_single(model, x_collocation, lr, steps, pde_residual, x_test=None, u_e
 
 # Test 
 if __name__ == "__main__":
+    import os,sys
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     from model.pinn_model import PINN
-    from physics.pde_cosine import u_exact, pde_residual_cosine, ansatz
+    from physics.pde_cosine import u_exact, pde_residual_loss, ansatz
     import jax.random as jr
 
     save_dir = "outputs/single_pinn_cosine_15"
@@ -55,16 +58,16 @@ if __name__ == "__main__":
     key = jr.PRNGKey(0)
     model = PINN(key, ansatz)
 
-    x_collocation = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 1000)
-    x_test = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 1000)
+    x_collocation = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 200)
+    x_test = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 200)
 
     # 训练
     model, train_loss, test_l1 = train_single(
         model,
         x_collocation,
         lr=1e-3,
-        steps=50000,
-        pde_residual=pde_residual_cosine,
+        steps=5000,
+        pde_residual=pde_residual_loss,
         x_test=x_test,
         u_exact=u_exact,
     )

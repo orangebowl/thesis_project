@@ -1,7 +1,112 @@
 # utils/visualizer.py
+"""
+Here we implement the visualization
+
+1) Training loss 
+2) L1-Test loss
+3) Plot partial solutions of each subdomains
+4) Compare the prediction with the exact solution if exact solution is not None
+5) Compare the test loss of fbpinns with single pinn
+6) Plot the window functions
+
+"""
 import os
 import matplotlib.pyplot as plt
 import jax.numpy as jnp
+import jax
+import matplotlib.pyplot as plt
+from utils.window_function import my_window_func
+
+def plot_subdomain_partials(model, x_test, u_true, save_dir):
+    #print("[DEBUG] plot_subdomain_partials is called.")
+    total_with_ansatz = []
+
+    for i in range(len(model.subnets)):
+        partial_solution_i = jax.vmap(lambda x: model.subdomain_pred(i, x))(x_test)
+        partial_solution_i = partial_solution_i.reshape(-1)
+
+        window_i = model.subdomain_window(i, x_test)
+
+        windowed_partial = window_i * partial_solution_i
+
+        total_solution_i = model.ansatz(x_test, windowed_partial)
+        total_with_ansatz.append(total_solution_i)
+
+    total_with_ansatz = jnp.stack(total_with_ansatz, axis=1)
+
+    plt.figure(figsize=(10, 6))
+    n_sub = len(model.subnets)
+
+    for i in range(n_sub):
+        plt.plot(x_test, total_with_ansatz[:, i], label=f"Subdomain {i} Solution")
+
+    plt.plot(x_test, u_true, label="Exact Solution", color='black', linestyle='--', linewidth=2)
+
+    plt.xlabel('x')
+    plt.ylabel('Solution')
+    plt.title('Subdomain Solutions vs Exact Solution')
+    plt.legend(fontsize=8)
+    plt.grid(True)
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "subdomain_partials_with_exact.png"))
+        plt.close()
+
+def plot_prediction_vs_exact(x_test, u_true, u_pred, save_dir):
+    plt.figure()
+    plt.plot(x_test, u_pred, label="FBPINN Pred")
+    plt.plot(x_test, u_true, "--", label="Exact")
+    plt.title("FBPINN Prediction vs Exact")
+    plt.legend()
+    plt.grid(True)
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "fbpinn_prediction.png"), dpi=300)
+        plt.close()
+
+
+def plot_training_loss(train_loss, save_dir):
+    plt.figure()
+    plt.plot(train_loss, label="Train Loss")
+    plt.yscale("log")
+    plt.xlabel("Steps")
+    plt.grid(True)
+    plt.title("Training Loss")
+    plt.legend()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "fbpinn_loss_curve.png"), dpi=300)
+        plt.close()
+
+
+def plot_test_l1_curve(test_steps, test_l1, save_dir):
+    plt.figure()
+    plt.plot(test_steps, test_l1, label="Test L1 Error")
+    plt.yscale("log")
+    plt.xlabel("Steps")
+    plt.grid(True)
+    plt.title("Test L1 Error Curve")
+    plt.legend()
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "fbpinn_test_l1_curve.png"), dpi=300)
+        plt.close()
+
+
+def plot_window_weights(x_test, subdomains,n_sub, save_dir):
+    w_all = my_window_func(subdomains, n_sub, x_test)
+    plt.figure()
+    for i in range(w_all.shape[1]):
+        plt.plot(x_test, w_all[:, i], label=f"Window {i}")
+    plt.title("Window Function Weights")
+    plt.legend()
+    plt.grid(True)
+    if save_dir is not None:
+        plt.savefig(os.path.join(save_dir, "window_weights.png"), dpi=300)
+        plt.close()
+
+
+def save_training_stats(train_loss, test_steps, test_l1, save_dir):
+    jnp.savez(os.path.join(save_dir, "fbpinn_stats.npz"),
+              train_loss=train_loss, test_steps=test_steps, test_l1=test_l1)
+    print(f"FBPINNs finished. Results in {save_dir}")
+
 
 def plot_loss_curve(loss_history, save_path=None, title="Training Loss"):
     plt.figure()

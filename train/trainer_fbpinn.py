@@ -1,52 +1,175 @@
+import os
+import sys
+import yaml
+import importlib
 import jax
 import jax.numpy as jnp
 import optax
 import equinox as eqx
 
+# add path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-def loss_fbpinn(model, x_collocation, pde_residual, window_fn):
-    """
-    通用 FBPINN Loss 计算：基于 residual 和窗口函数。
-    """
-    residuals = jax.vmap(lambda x: pde_residual(model, x, window_fn))(x_collocation)
-    return jnp.mean(residuals ** 2)
+# import the model
+from model.fbpinn_model import FBPINN
+# import some data utils functions
+from utils.data_utils import generate_collocation_points, generate_subdomain
+# import some visualization functions
+from utils.visualizer import (
+    plot_prediction_vs_exact,
+    plot_training_loss,
+    plot_test_l1_curve,
+    plot_window_weights,
+    save_training_stats,
+    plot_subdomain_partials
+)
+from tqdm import trange
+from utils.data_utils  import generate_collocation_points
 
 
 @eqx.filter_jit
-def train_step(model, opt_state, x_collocation, optimizer, pde_residual, window_fn):
-    """
-    单步梯度更新：自动计算 loss 和梯度。
-    """
-    loss_val, grads = eqx.filter_value_and_grad(loss_fbpinn)(model, x_collocation, pde_residual, window_fn)
+def _step(model, opt_state, colloc_full, optimizer, residual_fn):
+    def loss_fn(m):                                # full-batch residual
+        return residual_fn(m, colloc_full)
+    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
     updates, opt_state = optimizer.update(grads, opt_state, model)
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss_val
+    return eqx.apply_updates(model, updates), opt_state, loss
 
 
-def train_fbpinn(model, x_collocation, steps, lr, pde_residual, window_fn):
-    """
-    通用 FBPINN 训练主函数
-    参数：
-      - model: FBPINN 模型（SmoothFBPINN）
-      - x_collocation: 全局 collocation 点
-      - steps: 训练步数
-      - lr: 学习率
-      - pde_residual: 外部传入的 residual 函数
-      - window_fn: 外部传入的窗口函数（Partition of Unity）
-    返回：
-      - model: 训练后的模型
-      - loss_list: 每步 loss 记录
-    """
-    optimizer = optax.adam(lr)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+def train_fbpinn(
+    *,
+    model,
+    subdomain_collocation_points,                  # list[n_sub] – 每子域全部点
+    steps,
+    lr,
+    pde_residual_loss,
+    x_test          = None,
+    u_exact         = None,
+    save_dir        = None,
+    checkpoint_every= 0,
+):
+    # 整包 collocation points（不再变化）
+    colloc_full = subdomain_collocation_points
 
-    loss_list = []
+    # 优化器
+    opt       = optax.adam(lr)
+    opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
-    for i in range(steps):
-        model, opt_state, loss_val = train_step(model, opt_state, x_collocation, optimizer, pde_residual, window_fn)
-        loss_list.append(loss_val)
+    # 训练循环
+    loss_hist, l1_hist, l1_steps = [], [], []
+    pbar = trange(steps, desc="FBPINN", dynamic_ncols=True)
+    for step in pbar:
+        # 单步更新（full-batch）
+        model, opt_state, loss = _step(model, opt_state,
+                                       colloc_full, opt, pde_residual_loss)
+        loss_val = float(loss); loss_hist.append(loss_val)
 
-        if i % 1000 == 0:
-            print(f"[FBPINN] Step={i}, Loss={loss_val:.3e}")
+        # 测试误差
+        if x_test is not None and (step % 1000 == 0 or step == steps-1):
+            l1 = float(jnp.mean(jnp.abs(jax.vmap(model)(x_test) - u_exact(x_test))))
+            l1_hist.append(l1); l1_steps.append(step)
+            pbar.set_postfix(loss=f"{loss_val:.2e}", l1=f"{l1:.2e}")
+        else:
+            pbar.set_postfix(loss=f"{loss_val:.2e}")
 
-    return model, loss_list
+        # checkpoint
+        if checkpoint_every and save_dir and (step+1) % checkpoint_every == 0:
+            os.makedirs(save_dir, exist_ok=True)
+            eqx.tree_serialise_leaves(
+                os.path.join(save_dir, f"ckpt_{step+1}.eqx"), model
+            )
+
+    return model, jnp.array(loss_hist), (jnp.array(l1_steps), jnp.array(l1_hist))
+
+
+# Test
+if __name__ == "__main__":
+    #Load Config
+    config_path = os.path.join(os.path.dirname(__file__), "..", "config", "run.yaml")
+    config_path = os.path.abspath(config_path)
+    
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    #PDE
+    pde_name = config["pde"]
+    pde_module = importlib.import_module(f"physics.{pde_name}")
+    u_exact = pde_module.u_exact
+    ansatz = pde_module.ansatz
+    pde_residual_loss = pde_module.pde_residual_loss
+    domain = pde_module.DOMAIN
+
+    #Training Configs
+    steps = config["training"]["steps"]
+    lr = config["training"]["lr"]
+    n_sub = config["training"]["n_sub"]
+    overlap = config["training"]["overlap"]
+    n_points_per_subdomain = config["training"]["n_points_per_subdomain"]
+
+    save_dir = config["save"]["output_dir"]
+    ckpt_every = config["save"]["checkpoint_every"]
+
+    activation_map = {
+        "tanh": jax.nn.tanh,
+        "relu": jax.nn.relu,
+        "gelu": jax.nn.gelu,
+        "sigmoid": jax.nn.sigmoid,
+    }
+    mlp_raw = config["mlp"]
+    mlp_config = {
+        **{k: mlp_raw[k] for k in ["in_size", "out_size", "width_size", "depth"]},
+        "activation": activation_map[mlp_raw["activation"]],
+    }
+
+    # generate subdomains
+    subdomains_list = generate_subdomain(domain, n_sub, overlap)
+
+    # Define Model
+    key = jax.random.PRNGKey(42)
+    model = FBPINN(
+        key=key,
+        num_subdomains=n_sub,
+        ansatz=ansatz,
+        subdomains=subdomains_list,
+        mlp_config=mlp_config
+    )
+
+    # Generate Collocation Points
+    subdomain_collocation_points, _ = generate_collocation_points(
+        domain=domain,
+        subdomains_list=subdomains_list,
+        n_points_per_subdomain=n_points_per_subdomain,
+        seed=0
+    )
+
+    # x_test
+    x_test = jnp.linspace(domain[0], domain[1], 300)
+
+    # Train
+    model, train_loss, (test_steps, test_l1) = train_fbpinn(
+        model=model,
+        subdomain_collocation_points=subdomain_collocation_points,
+        steps=steps,
+        lr=lr,
+        x_test=x_test,
+        save_dir=save_dir,
+        checkpoint_every=ckpt_every,
+        pde_residual_loss=pde_residual_loss,
+        u_exact=u_exact
+    )
+
+    # Save Plots
+    print("Done training. Saving plots.")
+    u_pred = jax.vmap(model)(x_test)
+    u_true = u_exact(x_test)
+
+    plot_prediction_vs_exact(x_test, u_true, u_pred, save_dir)
+    plot_training_loss(train_loss, save_dir)
+    plot_test_l1_curve(test_steps, test_l1, save_dir)
+    plot_window_weights(x_test, subdomains_list, n_sub, save_dir)
+    plot_subdomain_partials(model, x_test, u_true, save_dir)
+    save_training_stats(train_loss, test_steps, test_l1, save_dir)
+
+    final_l1 = float(test_l1[-1]) if len(test_l1) > 0 else float('nan')
+    print(f"Final L1 error = {final_l1:.4e}")
+    print(f"Results saved to {save_dir}")

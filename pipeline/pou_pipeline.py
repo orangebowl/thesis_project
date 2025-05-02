@@ -14,7 +14,7 @@ from utils.visualizer import plot_solution, plot_loss_curve, plot_pou_weights
 def run_pipeline(config, pde_problem):
     output_dir = config["output_dir"]
 
-    # === Phase A: 训练 SinglePINN ===
+    # === Phase A: training SinglePINN ===
     print("=== Phase A: Training SinglePINN ===")
     pinn_model = train_single(
         pde_problem=pde_problem,
@@ -22,7 +22,7 @@ def run_pipeline(config, pde_problem):
         max_steps=config["pinn"]["max_steps"]
     )
 
-    # === 可视化 Phase A 解 ===
+    # === visualize Phase A  ===
     x_eval = jnp.linspace(pde_problem["domain"][0], pde_problem["domain"][1], 300)
     u_pred = jax.vmap(pinn_model)(x_eval)
     u_true = pde_problem["u_exact"](x_eval)

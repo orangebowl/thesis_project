@@ -1,73 +1,143 @@
-# model/rbf_pou.py
 import jax
 import jax.numpy as jnp
-import jax.random as jr
-import numpy as onp
 
-def init_rbf_params(rng_key, num_centers):
-    key1, _ = jr.split(rng_key)
-    centers = jr.normal(key1, shape=(num_centers,))
-    widths = jnp.ones((num_centers,)) * 0.2
-    return {"centers": centers, "widths": widths}
+class RBFPOUNet:
+    """
+    A simple Radial Basis Function (RBF) Partition of Unity (POU) network.
+    This network generates partitions of unity using Gaussian RBFs.
+    """
 
-def rbf_forward(params, x):
-    """
-    Args:
-        x: shape (N,)
-    Returns:
-        partitions: shape (N, num_centers)
-    """
-    centers = params["centers"]
-    widths = params["widths"]
-    dist_sq = (x[:, None] - centers[None, :])**2
-    raw = jnp.exp(- dist_sq / (widths**2))
-    sums = jnp.sum(raw, axis=1, keepdims=True) + 1e-12
-    return raw / sums
+    def __init__(self, input_dim=1, num_centers=5, width_val=0.4, key=jax.random.PRNGKey(0)):
+        """
+        Constructor to initialize the RBF POU network.
 
-def fit_local_polynomials_2nd_order(x_np, y_np, part_np):
-    """
-    针对每个子域，用二阶多项式拟合 (y ~ c0 + c1*x + c2*x^2)
-    Args:
-        x_np: shape (N,)
-        y_np: shape (N,)
-        part_np: shape (N, C)
-    Returns:
-        coeffs: shape (C, 3)
-    """
-    N, C = part_np.shape
-    coeffs = []
-    for i in range(C):
-        w_i = part_np[:, i]
-        # 构造加权最小二乘问题
-        X = onp.vstack([onp.ones_like(x_np), x_np, x_np**2]).T  # (N,3)
-        W = onp.diag(w_i)
-        A = W @ X
-        b = W @ y_np
-        # 求解最小二乘问题
-        c, _, _, _ = onp.linalg.lstsq(A, b, rcond=None)
-        coeffs.append(c)
-    return onp.array(coeffs)
+        Args:
+            input_dim (int): Dimensionality of the input features. Default is 1.
+            num_centers (int): Number of RBF centers. Default is 5.
+            width_val (float): Initial width (or scale) for each RBF. Default is 0.4.
+            key (jax.random.PRNGKey): A PRNGKey for random number generation.
+        """
+        self.num_centers = num_centers
 
-def compute_pou_approx(params, x, y):
-    """
-    利用当前 RBF 分区拟合全局逼近函数。
-    Args:
-        params: RBF参数
-        x: 输入, shape (N,)
-        y: 目标, shape (N,)
-    Returns:
-        y_pou: 全局逼近结果, shape (N,)
-    """
-    partitions = rbf_forward(params, x)  # (N,C)
-    # 停梯度后转为 numpy 数组进行二阶多项式拟合
-    part_np = onp.array(jax.lax.stop_gradient(partitions))
-    x_np = onp.array(jax.lax.stop_gradient(x))
-    y_np = onp.array(jax.lax.stop_gradient(y))
-    coeffs = fit_local_polynomials_2nd_order(x_np, y_np, part_np)
-    c0, c1, c2 = coeffs[:,0], coeffs[:,1], coeffs[:,2]
-    # 全局逼近：y_pou = sum_i partition_i * (c0_i + c1_i*x + c2_i*x^2)
-    y_pou = jnp.sum(
-        partitions * (jnp.array(c0)[None, :] + jnp.array(c1)[None, :]* x[:, None] + jnp.array(c2)[None, :]*(x[:, None]**2)),
-        axis=1
-    )
-    return y_pou
+        # Randomly initialize the centers in [0, 1], shape = (num_centers, input_dim)
+        self.centers = jax.random.uniform(key, (num_centers, input_dim), minval=0.0, maxval=1.0)
+
+        # Initialize all widths to the same value, shape = (num_centers,)
+        #self.widths = jnp.ones(num_centers) * width_val
+        self.widths = jax.random.uniform(key, (num_centers,), minval=0.05, maxval=0.5)
+
+    def init_params(self):
+        """
+        Returns a parameter dictionary with centers and widths 
+        that were randomly initialized in the constructor.
+        
+        Returns:
+            dict: 
+                {
+                    "centers": (num_centers, input_dim),
+                    "widths": (num_centers,)
+                }
+        """
+        return {
+            "centers": self.centers,
+            "widths": self.widths
+        }
+
+    def init_params_fixed(self):
+        """
+        Returns a parameter dictionary where the centers are equally spaced in [0, 1] 
+        (reshaped to (num_centers, 1)) and the widths are fixed to 0.01 for all centers.
+
+        Returns:
+            dict:
+                {
+                    "centers": (num_centers, 1),
+                    "widths": (num_centers,)
+                }
+        """
+        # Create equally spaced centers in [0, 1]
+        centers = jnp.linspace(0.0, 1.0, self.num_centers).reshape(-1, 1)
+        # Set all widths to 0.01
+        widths = self.widths
+        
+        return {
+            "centers": centers,
+            "widths": widths
+        }
+        
+    @staticmethod
+    def forward(centers, widths, x):
+        """
+        Compute the partition of unity from given centers, widths, and inputs x.
+
+        The output partitions ensure that, for each x_i:
+            sum_{j=1..num_centers} partition_{ij} ~= 1
+
+        Args:
+            centers (jnp.ndarray): Shape (num_centers, input_dim).
+            widths (jnp.ndarray): Shape (num_centers,).
+            x (jnp.ndarray): Input array, shape (N,) if input_dim=1 
+                             or (N, input_dim) if input_dim>1.
+
+        Returns:
+            jnp.ndarray: The POU array of shape (N, num_centers), 
+                         where each row sums to approximately 1.
+        """
+        # If x is 1D, reshape to (N, 1) to handle broadcast correctly
+        x = x[:, None]  # shape (N, 1)
+        
+        # Broadcast x and centers for element-wise operations
+        x_broadcasted = x[:, None, :]             # shape (N, 1, 1)
+        centers_broadcasted = centers[None, :, :] # shape (1, num_centers, 1)
+        
+        # Compute squared distances (N, num_centers)
+        diff = x_broadcasted - centers_broadcasted  
+        dist_sq = jnp.sum(diff ** 2, axis=2)     
+        
+        # Broadcast widths to match (N, num_centers)
+        widths_broadcasted = widths[None, :]       # shape (1, num_centers)
+        
+        # Exponential radial basis function
+        rbf_vals = jnp.exp(-dist_sq / (widths_broadcasted ** 2))
+        
+        # Normalize so that each row sums to 1
+        rbf_sum = jnp.sum(rbf_vals, axis=1, keepdims=True) + 1e-9
+        partitions = rbf_vals / rbf_sum
+        return partitions
+
+
+if __name__ == "__main__":
+    # Example usage:
+
+    # 1) Create an RBFPOUNet with default width_val=0.4
+    rbf_net_default = RBFPOUNet(input_dim=1, num_centers=5)
+    params_def = rbf_net_default.init_params()
+
+    # Prepare an input array x in [0, 1]
+    x = jnp.linspace(0, 1, 20)
+    partitions_def = rbf_net_default.forward(params_def["centers"], params_def["widths"], x)
+
+    print("Default initialization:")
+    print("Centers:\n", params_def["centers"])
+    print("Widths:\n", params_def["widths"])
+    print("Sum of partitions per input:\n", jnp.sum(partitions_def, axis=1))
+
+    # 2) Create an RBFPOUNet with a custom width_val=0.01
+    rbf_net_small_width = RBFPOUNet(input_dim=1, num_centers=5, width_val=0.01)
+    params_small = rbf_net_small_width.init_params()
+    partitions_small = rbf_net_small_width.forward(params_small["centers"], params_small["widths"], x)
+
+    print("\nCustom width=0.01 initialization:")
+    print("Centers:\n", params_small["centers"])
+    print("Widths:\n", params_small["widths"])
+    print("Sum of partitions per input:\n", jnp.sum(partitions_small, axis=1))
+
+    # 3) Use the fixed initialization method (centers equally spaced, widths=0.01)
+    rbf_net_fixed = RBFPOUNet(input_dim=1, num_centers=5, key=jax.random.PRNGKey(42))
+    params_fixed = rbf_net_fixed.init_params_fixed()
+    partitions_fixed = rbf_net_fixed.forward(params_fixed["centers"], params_fixed["widths"], x)
+
+    print("\nFixed initialization (linspace centers, width=0.01):")
+    print("Centers:\n", params_fixed["centers"])
+    print("Widths:\n", params_fixed["widths"])
+    print("Sum of partitions per input:\n", jnp.sum(partitions_fixed, axis=1))
