@@ -1,15 +1,12 @@
 import jax
 import jax.numpy as jnp
+"""
+functions that used in window.py to generate window functions
+"""
 
 def generate_subdomain(domain, n_sub, overlap):
     """generate uniform subdomain according to the domain, 
-    number of subdomains and the length of overlap
-    
-    Args:
-        domain:(float,float):global interval
-        n_sub: int: number of subdomains
-        overlap: float
-    """
+    number of subdomains and the length of overlap"""
     total_len = domain[1] - domain[0]
     step_size = total_len / n_sub
     width = step_size + overlap
@@ -26,20 +23,7 @@ def generate_subdomain(domain, n_sub, overlap):
     return subdomains_list 
 
 def generate_collocation_points(domain, subdomains_list, n_points_per_subdomain, seed=0):
-    """
-    Generate global collocation points and assign them to their respective subdomains.
-
-    Args:
-        domain (tuple): The global domain as a tuple (left, right).
-        subdomains_list (list of tuples): A list of subdomains, each defined by (left, right).
-        n_points_per_subdomain (int): Number of collocation points intended per subdomain.
-        seed (int): Random seed for reproducibility (default: 0).
-
-    Returns:
-        subdomain_collocation_points (list of jnp.ndarray): A list of arrays, each containing the
-            collocation points that fall within the corresponding subdomain.
-        global_collocation_points (jnp.ndarray): The full set of randomly generated collocation points.
-    """
+    """Generate global collocation points and assign them to their respective subdomains."""
     n_sub = len(subdomains_list)
     n_total_collocation = n_sub * n_points_per_subdomain
     key = jax.random.PRNGKey(seed)

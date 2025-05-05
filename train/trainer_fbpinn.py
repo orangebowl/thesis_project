@@ -35,11 +35,17 @@ def _step(model, opt_state, colloc_full, optimizer, residual_fn):
     updates, opt_state = optimizer.update(grads, opt_state, model)
     return eqx.apply_updates(model, updates), opt_state, loss
 
+# Compute the l1 error using jax
+@eqx.filter_jit
+def compute_l1(model, x_test, u_test_exact):
+    pred = jax.vmap(model)(x_test).squeeze()
+    return jnp.mean(jnp.abs(pred - u_test_exact.squeeze()))
+
 
 def train_fbpinn(
     *,
     model,
-    subdomain_collocation_points,                  # list[n_sub] – 每子域全部点
+    subdomain_collocation_points, # list[n_sub] 
     steps,
     lr,
     pde_residual_loss,
@@ -51,22 +57,24 @@ def train_fbpinn(
     # 整包 collocation points（不再变化）
     colloc_full = subdomain_collocation_points
 
-    # 优化器
+    # opt
     opt       = optax.adam(lr)
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
-    # 训练循环
+    # training loop
     loss_hist, l1_hist, l1_steps = [], [], []
     pbar = trange(steps, desc="FBPINN", dynamic_ncols=True)
+
     for step in pbar:
-        # 单步更新（full-batch）
         model, opt_state, loss = _step(model, opt_state,
                                        colloc_full, opt, pde_residual_loss)
         loss_val = float(loss); loss_hist.append(loss_val)
 
-        # 测试误差
-        if x_test is not None and (step % 1000 == 0 or step == steps-1):
-            l1 = float(jnp.mean(jnp.abs(jax.vmap(model)(x_test) - u_exact(x_test))))
+        # l1 error
+        if x_test is not None and (step % 1 == 0 or step == steps-1):
+            u_test_exact = u_exact(x_test) 
+            l1 = float(compute_l1(model, x_test, u_test_exact))
+            #l1 = float(jnp.mean(jnp.abs(jax.vmap(model)(x_test) - u_test_exact)))
             l1_hist.append(l1); l1_steps.append(step)
             pbar.set_postfix(loss=f"{loss_val:.2e}", l1=f"{l1:.2e}")
         else:
@@ -84,14 +92,14 @@ def train_fbpinn(
 
 # Test
 if __name__ == "__main__":
-    #Load Config
+    # Load Config
     config_path = os.path.join(os.path.dirname(__file__), "..", "config", "run.yaml")
     config_path = os.path.abspath(config_path)
-    
+
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    #PDE
+    # PDE configuration
     pde_name = config["pde"]
     pde_module = importlib.import_module(f"physics.{pde_name}")
     u_exact = pde_module.u_exact
@@ -99,7 +107,7 @@ if __name__ == "__main__":
     pde_residual_loss = pde_module.pde_residual_loss
     domain = pde_module.DOMAIN
 
-    #Training Configs
+    # Training Configs
     steps = config["training"]["steps"]
     lr = config["training"]["lr"]
     n_sub = config["training"]["n_sub"]
@@ -121,7 +129,7 @@ if __name__ == "__main__":
         "activation": activation_map[mlp_raw["activation"]],
     }
 
-    # generate subdomains
+    # Generate subdomains
     subdomains_list = generate_subdomain(domain, n_sub, overlap)
 
     # Define Model
@@ -142,10 +150,10 @@ if __name__ == "__main__":
         seed=0
     )
 
-    # x_test
+    # Test points (x_test)
     x_test = jnp.linspace(domain[0], domain[1], 300)
 
-    # Train
+    # Train the model
     model, train_loss, (test_steps, test_l1) = train_fbpinn(
         model=model,
         subdomain_collocation_points=subdomain_collocation_points,

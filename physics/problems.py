@@ -18,7 +18,6 @@ class PDEProblem:
 class CosineODE(PDEProblem):
     omega  = 15.0
     domain = (-2 * jnp.pi, 2 * jnp.pi)
-    order  = 1
 
     # Ansatz (hard contraint)
     @staticmethod
@@ -44,9 +43,9 @@ class CosineODE(PDEProblem):
         
 class SinPhiPoisson(PDEProblem):
     """
-    二阶 ODE:  u''(x) + f(x) = 0 ,  x∈[0, 8]
-    解析解   :  u(x) = sin(π x² /4)
-    边界条件 :  u(0)=u(8)=0 通过 ansatz 硬约束
+    second order ODE:  u''(x) + f(x) = 0 ,  x∈[0, 8]
+    exact solution   :  u(x) = sin(π x² /4)
+    boundary constraint :  u(0)=u(8)=0 use ansatz as hard constraint
     """
     domain = (0.0, 8.0)
     _pi4   = jnp.pi / 4.0
@@ -55,18 +54,16 @@ class SinPhiPoisson(PDEProblem):
     def exact(x):
         return jnp.sin((jnp.pi / 4.0) * x**2)
 
-    # ---------- f(x) ----------
     def _f(self, x):
         return (jnp.pi**2 / 4.0) * x**2 * jnp.sin(self._pi4 * x**2) \
                - (jnp.pi / 2.0) * jnp.cos(self._pi4 * x**2)
 
-    # ---------- ansatz ----------
     def ansatz(self, x, nn_out):
         left, right = self.domain
         A = (1 - jnp.exp(-x)) * (1 - jnp.exp(-(right - x)))
         return A * nn_out
 
-    # ---------- 单子域残差 ----------
+    # single residual in one subdomain
     def _single_res(self, model, x):
         def u_scalar(xx):
             return model(xx).squeeze()
@@ -75,10 +72,49 @@ class SinPhiPoisson(PDEProblem):
         residual = u_xx + self._f(x)
         return jnp.mean(residual**2)
 
-    # ---------- 总残差：兼容 PINN / FBPINN ----------
     def residual(self, model, x):
         if isinstance(x, (list, tuple)):                 # FBPINN: list[ndarray]
             losses = [self._single_res(model, xi) for xi in x]
             return jnp.sum(jnp.stack(losses))
         else:                                            # PINN: ndarray
             return self._single_res(model, x)
+
+
+import jax
+import jax.numpy as jnp
+
+class SineX6ODE(PDEProblem):
+    """
+    First-order nonlinear ODE:
+        dy/dx = 6x^5 * cos(x^6), with y(0) = 0
+    Exact solution:
+        y(x) = sin(x^6)
+    Domain:
+        x ∈ [0, 2]
+    """
+    domain = (0, 2)
+    @staticmethod
+    def exact(x):
+        return jnp.sin(x**6)
+
+    # Hard constraint: y(0) = 0
+    @staticmethod
+    def ansatz(x, nn_out):
+        return jnp.tanh(x) * nn_out  # Satisfies y(0) = 0
+
+    def _single_res(self, model, x):
+        def u_scalar(xx):
+            return model(xx).squeeze()
+
+        u_x = jax.vmap(jax.grad(u_scalar))(x)
+        # The target now directly uses x and cos(x^4) instead of relying on y
+        target = 6 * x**5 * jnp.cos(x**6)
+        return jnp.mean((u_x - target)**2)
+
+    def residual(self, model, x):
+        if isinstance(x, (list, tuple)):  # FBPINN
+            losses = [self._single_res(model, xi) for xi in x]
+            return jnp.sum(jnp.stack(losses))
+        else:  # PINN
+            return self._single_res(model, x)
+
