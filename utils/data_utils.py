@@ -42,3 +42,15 @@ def generate_collocation_points(domain, subdomains_list, n_points_per_subdomain,
         #(f"Subdomain [{left:.2f}, {right:.2f}]: {len(points_in_subdomain)} points")
 
     return subdomain_collocation_points, global_collocation_points
+
+if __name__ == "__main__":
+    domain = (0,2)
+    n_sub = 2
+    overlap = 0.5
+    subdomains_list = generate_subdomain(domain, n_sub, overlap)
+    print(subdomains_list) #should be [(-0.25, 1.25), (0.75, 2.25)]
+    
+    n_points_per_subdomain = 500
+    subdomain_collocation_points, global_collocation_points = generate_collocation_points(domain, subdomains_list, n_points_per_subdomain, seed=0)
+    for i, subdomain in enumerate(subdomain_collocation_points):
+        print(f"Subdomain {i} range: min = {min(subdomain)}, max = {max(subdomain)}")

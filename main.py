@@ -32,8 +32,9 @@ def build_model(CFG, prob, key, mlp_cfg):
     else:
         from model.pinn_model import PINN
         model = PINN(key, prob.ansatz, width=mlp_cfg["width_size"], depth=mlp_cfg["depth"])
-        total = CFG["training"]["n_sub"] * CFG["training"]["n_points_per_subdomain"]
+        total = CFG["training"]["n_collocation_points"]
         colloc = jnp.linspace(*prob.domain, total)
+        subs = None  # Set to None, since PINN doesn't require subs
         trainer_mod = "train.trainer_single"
 
     return subs, model, colloc, trainer_mod
@@ -64,12 +65,22 @@ def train_model(model, colloc, trainer_mod, RESIDUAL, CFG, prob):
         )
     else:
         # PINN
-        model, loss_hist, t_l1 = train_fn(
+        model,  loss_hist, (t_steps, t_l1) = train_fn(
+            model,
+            colloc,
+            lr,
+            steps,
+            RESIDUAL,
+            batch_size=CFG["training"]["batch_size"],  # Specify mini-batch size
+            x_test=jnp.linspace(*prob.domain, 300),
+            u_exact=prob.exact,
+        )
+        """model, loss_hist, t_l1 = train_fn(
             model, colloc, lr, steps,
             RESIDUAL, jnp.linspace(*prob.domain, 300), prob.exact,
             batch_size=CFG["training"]["batch_size"]
         )
-        t_steps = jnp.arange(len(t_l1))
+        t_steps = jnp.arange(len(t_l1))"""
 
     return model, loss_hist, t_l1, t_steps, out_dir
 
@@ -83,7 +94,7 @@ def visualize_results(loss_hist, t_steps, t_l1, subs, model, prob, out_dir):
     plot_training_loss(loss_hist, out_dir)
     plot_test_l1_curve(t_steps, t_l1, out_dir)
 
-    if len(subs) > 0:
+    if subs and len(subs) > 0:
         plot_window_weights(x, subs, len(subs), out_dir)
         plot_subdomain_partials(model, x, u_true, out_dir)
 

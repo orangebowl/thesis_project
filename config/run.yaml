@@ -1,29 +1,31 @@
 # config/fbpinn.yaml
 # choose the model
-model_type: "fbpinn"  # pinn/fbpinn
+model_type: "pinn"  # pinn/fbpinn
 
 # choose the problem
 pde: "problems.SineX6ODE"   # which physics module, define the problem in physics/problem.py
 # training config
 training:
-  steps: 10000
+  steps: 50000
   lr: 0.001
+  checkpoint_every: None
+# FBPINN
   n_sub: 2
   overlap: 1
-  n_points_per_subdomain: 100
-  checkpoint_every: None
+  n_points_per_subdomain: 500
+# PINN
 # mini-batch param, only for pinn, not necessary for fbpinn
-  batch_strategy: "fixed" # fixed/equal
-  batch_size: 1000     
+  n_collocation_points: 600
+  batch_size: 100     
   shuffle: true #shuffle every epoch
 
 mlp:
   in_size: 1
   out_size: 1
-  width_size: 16
-  depth: 2
+  width_size: 128
+  depth: 5
   activation: "tanh"   
 
 save:
-  output_dir: "outputs/outputs_SineX4ODE"
-  checkpoint_every: 5000
+  output_dir: "outputs/outputs_PINN_SinX6ODE"
+  checkpoint_every: 0

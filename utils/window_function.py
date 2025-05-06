@@ -51,14 +51,14 @@ if __name__ == "__main__":
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     from utils.data_utils import generate_subdomain
     
-    x_test = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 300)
-    domain = (-2 * jnp.pi, 2 * jnp.pi)
-    n_sub = 5
-    overlap = 4
+    x_test = jnp.linspace(0,2,100)
     tol = 1e-8
-    subdomains_tuple = generate_subdomain(domain=domain,n_sub=n_sub,overlap=overlap)
+    domain = (0,2)
+    n_sub = 2
+    overlap = 0.5
+    subdomains_list = generate_subdomain(domain, n_sub, overlap)# [(-0.25, 1.25), (0.75, 2.25)]
     # compute window weights
-    window_weights = my_window_func(subdomains_tuple, n_sub, x_test, tol=tol)
+    window_weights = my_window_func(subdomains_list, n_sub, x_test, tol=tol)
     # window_weights shape: (300, n_sub)
 
     # plot

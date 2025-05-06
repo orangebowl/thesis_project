@@ -71,7 +71,7 @@ def train_fbpinn(
         loss_val = float(loss); loss_hist.append(loss_val)
 
         # l1 error
-        if x_test is not None and (step % 1 == 0 or step == steps-1):
+        if x_test is not None and (step % 100 == 0 or step == steps-1):
             u_test_exact = u_exact(x_test) 
             l1 = float(compute_l1(model, x_test, u_test_exact))
             #l1 = float(jnp.mean(jnp.abs(jax.vmap(model)(x_test) - u_test_exact)))
