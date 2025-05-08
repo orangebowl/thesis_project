@@ -118,3 +118,45 @@ class SineX6ODE(PDEProblem):
         else:  # PINN
             return self._single_res(model, x)
 
+class Poisson2D(PDEProblem):
+    """
+    2D Poisson Problem:
+        -Δu = f(x, y) in [0,1]^2
+        u = 0 on boundary
+    Exact: u(x,y) = sin(2πx) * sin(2πy)
+    """
+
+    domain = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))  # 2D
+
+    @staticmethod
+    def exact(xy):
+        x, y = xy[..., 0], xy[..., 1]
+        return jnp.sin(2 * jnp.pi * x) * jnp.sin(2 * jnp.pi * y)
+
+    @staticmethod
+    def ansatz(xy, nn_out):
+        x, y = xy[..., 0], xy[..., 1]
+        return x * (1 - x) * y * (1 - y) * nn_out  # zero on ∂Ω
+
+    def _single_res(self, model, xy_batch):
+        """Residual for -Δu = f, where xy_batch shape = (N, 2)"""
+
+        def u_fn(xx):  # xx is (2,)
+            return model(xx).squeeze()
+
+        # Compute Hessian ∇²u for each point in batch
+        hessian_fn = jax.jacfwd(jax.jacrev(u_fn))  # (2,) → (2,2)
+        hessians = jax.vmap(hessian_fn)(xy_batch)  # (N,2,2)
+        laplacians = jnp.trace(hessians, axis1=-2, axis2=-1)  # (N,)
+
+        x, y = xy_batch[:, 0], xy_batch[:, 1]
+        f = -8 * jnp.pi**2 * jnp.sin(2 * jnp.pi * x) * jnp.sin(2 * jnp.pi * y)  # (N,)
+
+        return jnp.mean((laplacians - f) ** 2)
+
+    def residual(self, model, xy):
+        if isinstance(xy, (list, tuple)):
+            losses = [self._single_res(model, xi) for xi in xy]
+            return jnp.sum(jnp.stack(losses))
+        else:
+            return self._single_res(model, xy)

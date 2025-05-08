@@ -18,47 +18,34 @@ class RBFPOUNet:
             key (jax.random.PRNGKey): A PRNGKey for random number generation.
         """
         self.num_centers = num_centers
-
+        self.key = key
         # Randomly initialize the centers in [0, 1], shape = (num_centers, input_dim)
         self.centers = jax.random.uniform(key, (num_centers, input_dim), minval=0.0, maxval=1.0)
 
         # Initialize all widths to the same value, shape = (num_centers,)
         #self.widths = jnp.ones(num_centers) * width_val
-        self.widths = jax.random.uniform(key, (num_centers,), minval=0.05, maxval=0.5)
+        self.width_val = width_val
 
     def init_params(self):
         """
         Returns a parameter dictionary with centers and widths 
         that were randomly initialized in the constructor.
-        
-        Returns:
-            dict: 
-                {
-                    "centers": (num_centers, input_dim),
-                    "widths": (num_centers,)
-                }
         """
+        widths = jax.random.uniform(self.key, (self.num_centers,), minval=0.05, maxval=0.5) #Random select widths from 0.05 to 0.5
         return {
             "centers": self.centers,
-            "widths": self.widths
+            "widths": widths
         }
 
     def init_params_fixed(self):
         """
         Returns a parameter dictionary where the centers are equally spaced in [0, 1] 
         (reshaped to (num_centers, 1)) and the widths are fixed to 0.01 for all centers.
-
-        Returns:
-            dict:
-                {
-                    "centers": (num_centers, 1),
-                    "widths": (num_centers,)
-                }
         """
         # Create equally spaced centers in [0, 1]
         centers = jnp.linspace(0.0, 1.0, self.num_centers).reshape(-1, 1)
+        widths = jnp.ones(self.num_centers) * self.width_val
         # Set all widths to 0.01
-        widths = self.widths
         
         return {
             "centers": centers,
@@ -109,7 +96,7 @@ class RBFPOUNet:
 if __name__ == "__main__":
     # Example usage:
 
-    # 1) Create an RBFPOUNet with default width_val=0.4
+    # Create an RBFPOUNet with default width_val=0.4
     rbf_net_default = RBFPOUNet(input_dim=1, num_centers=5)
     params_def = rbf_net_default.init_params()
 
