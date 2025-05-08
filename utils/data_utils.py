@@ -4,23 +4,45 @@ import jax.numpy as jnp
 functions that used in window.py to generate window functions
 """
 
-def generate_subdomain(domain, n_sub, overlap):
-    """generate uniform subdomain according to the domain, 
-    number of subdomains and the length of overlap"""
-    total_len = domain[1] - domain[0]
-    step_size = total_len / n_sub
-    width = step_size + overlap
+def generate_subdomains(domain, n_sub_per_dim, overlap):
+    """
+    Generate uniformly spaced subdomains (with overlap) in 1D or multi-D.
 
-    centers = jnp.linspace(domain[0] + step_size / 2,
-                           domain[1] - step_size / 2,
-                           n_sub)
-    
-    subdomains_list = []
-    for i in range(n_sub):
-        left = float(centers[i] - width / 2)
-        right = float(centers[i] + width / 2)
-        subdomains_list.append((left, right)) # tuple list
-    return subdomains_list 
+    Args:
+        domain: tuple of (lower_bounds: jnp.array, upper_bounds: jnp.array), shape (d,)
+        n_sub_per_dim: int or list of ints for each dim
+        overlap: float (relative size, e.g., 0.2)
+
+    Returns:
+        subdomains: list of (left: jnp.array, right: jnp.array)
+    """
+    if isinstance(n_sub_per_dim, int):
+        n_sub_per_dim = [n_sub_per_dim] * len(domain[0])  # scalar → list
+
+    dim = len(domain[0])
+    grid_axes = []
+    step_sizes = []
+    for i in range(dim):
+        a, b = domain[0][i], domain[1][i]
+        n = n_sub_per_dim[i]
+        total_len = b - a
+        step = total_len / n
+        centers = jnp.linspace(a + step / 2, b - step / 2, n)
+        grid_axes.append(centers)
+        step_sizes.append(step)
+
+    mesh = jnp.meshgrid(*grid_axes, indexing='ij')  # multi-D center coords
+    center_points = jnp.stack([m.reshape(-1) for m in mesh], axis=-1)  # (n_sub_total, d)
+
+    subdomains = []
+    for center in center_points:
+        width = jnp.array(step_sizes) * (1 + overlap)
+        left = center - width / 2
+        right = center + width / 2
+        subdomains.append((left, right))
+
+    return subdomains
+
 
 def generate_collocation_points(domain, subdomains_list, n_points_per_subdomain, seed=0):
     """Generate global collocation points and assign them to their respective subdomains."""

@@ -155,7 +155,7 @@ class Poisson2D(PDEProblem):
         return jnp.mean((laplacians - f) ** 2)
 
     def residual(self, model, xy):
-        if isinstance(xy, (list, tuple)):
+        if isinstance(xy, list):
             losses = [self._single_res(model, xi) for xi in xy]
             return jnp.sum(jnp.stack(losses))
         else:

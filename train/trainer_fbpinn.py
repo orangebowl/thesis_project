@@ -13,7 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # import the model
 from model.fbpinn_model import FBPINN
 # import some data utils functions
-from utils.data_utils import generate_collocation_points, generate_subdomain
+from utils.data_utils import generate_collocation_points, generate_subdomains
 # import some visualization functions
 from utils.visualizer import (
     plot_prediction_vs_exact,
