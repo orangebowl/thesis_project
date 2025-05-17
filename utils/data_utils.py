@@ -27,7 +27,9 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
         n = n_sub_per_dim[i]
         total_len = b - a
         step = total_len / n
-        centers = jnp.linspace(a + step / 2, b - step / 2, n)
+        #centers = jnp.linspace(a + step / 2, b - step / 2, n)
+        centers = jnp.linspace(a, b, n)
+        print("centers",centers)
         grid_axes.append(centers)
         step_sizes.append(step)
 
@@ -36,9 +38,11 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
 
     subdomains = []
     for center in center_points:
-        width = jnp.array(step_sizes) * (1 + overlap)
-        left = center - width / 2
-        right = center + width / 2
+        width = jnp.array(step_sizes) + overlap/2
+        left = center - width
+        right = center + width
+        #left = center - width / 2
+        #right = center + width / 2
         subdomains.append((left, right))
 
     return subdomains
@@ -66,13 +70,21 @@ def generate_collocation_points(domain, subdomains_list, n_points_per_subdomain,
     return subdomain_collocation_points, global_collocation_points
 
 if __name__ == "__main__":
-    domain = (0,2)
-    n_sub = 2
+    
+    # 1D Test
+    domain_1d = (jnp.array([0.0]), jnp.array([1.0]))
     overlap = 0.5
-    subdomains_list = generate_subdomain(domain, n_sub, overlap)
-    print(subdomains_list) #should be [(-0.25, 1.25), (0.75, 2.25)]
+    n_sub = 2
+    subdomains_1d = generate_subdomains(domain_1d, n_sub, overlap)
+    print(subdomains_1d) #should be [(-0.25, 1.25), (0.75, 2.25)]
     
     n_points_per_subdomain = 500
-    subdomain_collocation_points, global_collocation_points = generate_collocation_points(domain, subdomains_list, n_points_per_subdomain, seed=0)
+    subdomain_collocation_points, global_collocation_points = generate_collocation_points(domain_1d, subdomains_1d, n_points_per_subdomain, seed=0)
     for i, subdomain in enumerate(subdomain_collocation_points):
         print(f"Subdomain {i} range: min = {min(subdomain)}, max = {max(subdomain)}")
+
+    # 2D Test
+    domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))
+    n_sub_2d = 2 # per dimension
+    subdomains_2d = generate_subdomains(domain_2d, n_sub_2d, overlap)
+    print(subdomains_2d)

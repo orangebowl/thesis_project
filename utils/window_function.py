@@ -46,10 +46,6 @@ def my_window_func(subdomains_tuple, n_sub, x, tol=1e-8):
     return w_norm
 
 
-
-
-
-# 放在 utils/test_window.py 中或你的 main 脚本底部
 if __name__ == "__main__":
     import os, sys
     import matplotlib.pyplot as plt
@@ -63,7 +59,7 @@ if __name__ == "__main__":
     overlap = 0.2
     tol = 1e-8
     n_sub_1d = 2
-    n_sub_2d = 3
+    n_sub_2d = 2
 
     # 2D test
     domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))
