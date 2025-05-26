@@ -1,5 +1,7 @@
-import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy.stats.qmc import LatinHypercube, Halton, Sobol
+import matplotlib.pyplot as plt
 """
 functions that used in window.py to generate window functions
 """
@@ -26,7 +28,7 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
         a, b = domain[0][i], domain[1][i]
         n = n_sub_per_dim[i]
         total_len = b - a
-        step = total_len / n
+        step = total_len / (n-1)
         #centers = jnp.linspace(a + step / 2, b - step / 2, n)
         centers = jnp.linspace(a, b, n)
         print("centers",centers)
@@ -38,7 +40,7 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
 
     subdomains = []
     for center in center_points:
-        width = jnp.array(step_sizes) + overlap/2
+        width = jnp.array(step_sizes)/2 + overlap/2 # half
         left = center - width
         right = center + width
         #left = center - width / 2
@@ -48,43 +50,125 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
     return subdomains
 
 
-def generate_collocation_points(domain, subdomains_list, n_points_per_subdomain, seed=0):
-    """Generate global collocation points and assign them to their respective subdomains."""
-    n_sub = len(subdomains_list)
-    n_total_collocation = n_sub * n_points_per_subdomain
-    key = jax.random.PRNGKey(seed)
+### Different sampling strategy
+# =================== 辅助函数 =================== #
+def scale_sample(samples: np.ndarray, domain):
+    """
+    将在 [0,1]^2 上的采样点映射回给定的 domain = [(x_lo, y_lo), (x_hi, y_hi)].
+    """
+    (x_lo, y_lo), (x_hi, y_hi) = domain
+    return samples * np.array([x_hi - x_lo, y_hi - y_lo]) + np.array([x_lo, y_lo])
 
-    # Sample uniformly within the global domain
-    global_collocation_points = jax.random.uniform(
-        key, (n_total_collocation,), minval=domain[0], maxval=domain[1]
-    )
+def _van_der_corput(index, base=2):
+    """
+    范德科蒙 (Van der Corput) 展开，将整数 index 映射为 [0,1] 之间的小数。
+    用于 Hammersley 序列等低差异采样。
+    """
+    result = 0.0
+    f = 1.0
+    i = index
+    while i > 0:
+        f /= base
+        result += f * (i % base)
+        i //= base
+    return result
 
-    # Assign points to subdomains
-    subdomain_collocation_points = []
-    for left, right in subdomains_list:
-        mask = (global_collocation_points >= left) & (global_collocation_points <= right)
-        points_in_subdomain = global_collocation_points[mask]
-        subdomain_collocation_points.append(points_in_subdomain)
-        #(f"Subdomain [{left:.2f}, {right:.2f}]: {len(points_in_subdomain)} points")
+# =================== 主函数：采样入口 =================== #
+def generate_collocation(domain, n_pts, strategy="random", seed=None, scramble=False):
+    """
+    根据 strategy 生成 n_pts^2 个二维采样点，返回 shape=(n_pts^2, 2).
+    可选的 strategy:
+        - "uniform"    : 均匀网格采样
+        - "random"     : 随机
+        - "lhs"        : Latin Hypercube
+        - "halton"     : Halton  (支持 scramble)
+        - "sobol"      : Sobol   (支持 scramble)
+        - "hammersley" : Hammersley
+    其余参数:
+        - seed       : 随机种子(对 random / lhs / halton / sobol 有效)
+        - scramble   : 是否扰动(对 halton / sobol 有效)
+    """
 
-    return subdomain_collocation_points, global_collocation_points
+    (x_lo, y_lo), (x_hi, y_hi) = domain
+    N = n_pts ** 2  # 采样总数
 
+    # 根据 strategy 分支
+    if strategy.lower() == "uniform":
+        # 均匀网格
+        xs = np.linspace(x_lo, x_hi, n_pts)
+        ys = np.linspace(y_lo, y_hi, n_pts)
+        XX, YY = np.meshgrid(xs, ys, indexing='ij')
+        points = np.column_stack([XX.ravel(), YY.ravel()])
+
+    elif strategy.lower() == "random":
+        # 随机采样
+        rng = np.random.default_rng(seed)
+        samples_01 = rng.random((N, 2))
+        points = scale_sample(samples_01, domain)
+
+    elif strategy.lower() == "lhs":
+        # Latin Hypercube
+        sampler = LatinHypercube(d=2, seed=seed)
+        samples_01 = sampler.random(N)
+        points = scale_sample(samples_01, domain)
+
+    elif strategy.lower() == "halton":
+        # Halton (可 scramble)
+        sampler = Halton(d=2, scramble=scramble, seed=seed)
+        samples_01 = sampler.random(N)
+        points = scale_sample(samples_01, domain)
+
+    elif strategy.lower() == "sobol":
+        # Sobol (可 scramble)
+        sampler = Sobol(d=2, scramble=scramble, seed=seed)
+        samples_01 = sampler.random(N)
+        points = scale_sample(samples_01, domain)
+
+    elif strategy.lower() == "hammersley":
+        # Hammersley
+        points_01 = np.zeros((N, 2))
+        for i in range(N):
+            points_01[i, 0] = i / N
+            points_01[i, 1] = _van_der_corput(i, base=2)
+        points = scale_sample(points_01, domain)
+
+    else:
+        raise ValueError(f"Unknown strategy={strategy}. Choose from "
+                         f"['uniform','random','lhs','halton','sobol','hammersley'].")
+
+    return points
+
+# =================== 测试 & 可视化 =================== #
 if __name__ == "__main__":
-    
-    # 1D Test
-    domain_1d = (jnp.array([0.0]), jnp.array([1.0]))
-    overlap = 0.5
-    n_sub = 2
-    subdomains_1d = generate_subdomains(domain_1d, n_sub, overlap)
-    print(subdomains_1d) #should be [(-0.25, 1.25), (0.75, 2.25)]
-    
-    n_points_per_subdomain = 500
-    subdomain_collocation_points, global_collocation_points = generate_collocation_points(domain_1d, subdomains_1d, n_points_per_subdomain, seed=0)
-    for i, subdomain in enumerate(subdomain_collocation_points):
-        print(f"Subdomain {i} range: min = {min(subdomain)}, max = {max(subdomain)}")
+    domain = ((0, 0), (1, 1))
+    n_pts  = 4  # 采样 4^2=16 个点，方便可视化
 
-    # 2D Test
-    domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))
-    n_sub_2d = 2 # per dimension
-    subdomains_2d = generate_subdomains(domain_2d, n_sub_2d, overlap)
-    print(subdomains_2d)
+    # 不同采样方式
+    strategies = [
+        "uniform",
+        "random",
+        "lhs",
+        "halton",
+        "sobol",
+        "hammersley"
+    ]
+
+    # 生成并打印
+    for stg in strategies:
+        pts = generate_collocation(domain, n_pts, strategy=stg, seed=42, scramble=False)
+        print(f"\nStrategy: {stg}")
+        print(pts)
+
+    # 画图对比
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8), sharex=True, sharey=True)
+
+    for ax, stg in zip(axes.flat, strategies):
+        pts = generate_collocation(domain, n_pts, strategy=stg, seed=42, scramble=False)
+        ax.scatter(pts[:, 0], pts[:, 1], s=30, alpha=0.7, edgecolors='k')
+        ax.set_title(stg.capitalize())
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal", adjustable="box")
+
+    plt.tight_layout()
+    plt.show()

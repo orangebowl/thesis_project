@@ -21,6 +21,8 @@ pipeline
 
 # Ignore outputs
 outputs
+visualizations
+ResNet2D
 
 # Ignore VSCode settings
 .vscode/

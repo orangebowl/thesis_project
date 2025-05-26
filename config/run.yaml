@@ -1,6 +1,6 @@
 # config/fbpinn.yaml
 # choose the model
-model_type: "pinn"  # pinn/fbpinn
+model_type: "fbpinn"  # pinn/fbpinn
 
 # choose the problem
 pde: "problems.SineX6ODE"   # which physics module, define the problem in physics/problem.py

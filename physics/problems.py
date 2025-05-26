@@ -2,6 +2,7 @@
 import jax
 import jax.numpy as jnp
 
+
 class PDEProblem:
     domain: tuple # (left, right)
 
@@ -90,9 +91,9 @@ class SineX6ODE(PDEProblem):
     Exact solution:
         y(x) = sin(x^6)
     Domain:
-        x ∈ [0, 2]
+        x ∈ [0, 3]
     """
-    domain = (0, 2)
+    domain = (0, 3)
     @staticmethod
     def exact(x):
         return jnp.sin(x**6)
@@ -109,6 +110,41 @@ class SineX6ODE(PDEProblem):
         u_x = jax.vmap(jax.grad(u_scalar))(x)
         # The target now directly uses x and cos(x^4) instead of relying on y
         target = 6 * x**5 * jnp.cos(x**6)
+        return jnp.mean((u_x - target)**2)
+
+    def residual(self, model, x):
+        if isinstance(x, (list, tuple)):  # FBPINN
+            losses = [self._single_res(model, xi) for xi in x]
+            return jnp.sum(jnp.stack(losses))
+        else:  # PINN
+            return self._single_res(model, x)
+        
+class SineX5ODE(PDEProblem):
+    """
+    First-order nonlinear ODE:
+        dy/dx = 5x^4 * cos(x^5), with y(0) = 0
+    Exact solution:
+        y(x) = sin(x^5)
+    Domain:
+        x ∈ [0, 3]
+    """
+    domain = (0, 3)
+    @staticmethod
+    def exact(x):
+        return jnp.sin(x**5)
+
+    # Hard constraint: y(0) = 0
+    @staticmethod
+    def ansatz(x, nn_out):
+        return jnp.tanh(x) * nn_out  # Satisfies y(0) = 0
+
+    def _single_res(self, model, x):
+        def u_scalar(xx):
+            return model(xx).squeeze()
+
+        u_x = jax.vmap(jax.grad(u_scalar))(x)
+        # The target now directly uses x and cos(x^4) instead of relying on y
+        target = 5 * x**4 * jnp.cos(x**5)
         return jnp.mean((u_x - target)**2)
 
     def residual(self, model, x):
@@ -160,3 +196,62 @@ class Poisson2D(PDEProblem):
             return jnp.sum(jnp.stack(losses))
         else:
             return self._single_res(model, xy)
+        
+class Poisson2D_freq(PDEProblem):
+    """
+    2-D Poisson problem on Ω = [0,1]²
+        -Δu = f(x, y),     u|_{∂Ω} = 0
+    Exact solution (for testing):
+        u(x,y) = sin(2π x²) * sin(2π y²)
+    """
+
+    domain = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))  # 2D
+
+    @staticmethod
+    def exact(xy):
+        x, y = xy[..., 0], xy[..., 1]
+        return jnp.sin(2 * jnp.pi * x**2) * jnp.sin(2 * jnp.pi * y**2)
+
+    @staticmethod
+    def ansatz(xy, nn_out):
+        # 强制边界为 0 ⇒ x(1-x)*y(1-y)
+        x = xy[..., 0]
+        y = xy[..., 1]
+        factor = x*(1 - x)*y*(1 - y)  # (N,)
+        factor = factor[..., None]    # (N,1)
+        return factor*nn_out         # (N,1)
+
+    @staticmethod
+    def rhs(xy):
+        x, y = xy[..., 0], xy[..., 1]
+        sin_x2 = jnp.sin(2 * jnp.pi * x**2)
+        sin_y2 = jnp.sin(2 * jnp.pi * y**2)
+        cos_x2 = jnp.cos(2 * jnp.pi * x**2)
+        cos_y2 = jnp.cos(2 * jnp.pi * y**2)
+        term1 = -4 * jnp.pi * (sin_y2 * cos_x2 + sin_x2 * cos_y2)
+        term2 = 16 * (jnp.pi**2)*(x**2 + y**2)*sin_x2*sin_y2
+        return term1 + term2
+
+    def _single_res(self, model, xy_batch):
+        """Residual = mean(( -laplacian(u) - f )^2) over xy_batch."""
+        if xy_batch.shape[0] == 0:
+            return 0.0
+
+        def u_fn(pt_2d):
+            out = model(pt_2d)  # shape=(1,1) or scalar
+            return out.squeeze()
+
+        hessian_fn = jax.jacfwd(jax.jacrev(u_fn))
+        hessians   = jax.vmap(hessian_fn)(xy_batch)
+        laplacians = jnp.trace(hessians, axis1=-2, axis2=-1)
+        f_vals = self.rhs(xy_batch)
+        return jnp.mean( ( -laplacians - f_vals )**2 )
+
+    def residual(self, model, xy):
+        """
+        xy 若是 (N,2) => single batch,
+           若是 list => stack后处理,
+           若是 (n_sub,Nx,2) => for each sub batch.
+        这里简化，直接 single batch => (N,2).
+        """
+        return self._single_res(model, xy)

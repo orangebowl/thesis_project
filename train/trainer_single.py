@@ -80,7 +80,9 @@ def train_single(
                 continue
 
         loss_hist.append(loss_list[-1])  # Record the last loss value
-        l1_hist.append(l1_list[-1])  # Record the last L1 error value
+        #l1_hist.append(l1_list[-1])  # Record the last L1 error value
+        if l1_list:                        # ← 新增保护
+            l1_hist.append(l1_list[-1])    # 只有在真的算过 L1 时才记录
 
         # Save checkpoint
         if checkpoint_every and save_dir and (i + 1) % checkpoint_every == 0:
