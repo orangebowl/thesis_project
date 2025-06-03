@@ -1,10 +1,8 @@
+# utils/data_utils.py
+
 import jax.numpy as jnp
 import numpy as np
 from scipy.stats.qmc import LatinHypercube, Halton, Sobol
-import matplotlib.pyplot as plt
-"""
-functions that used in window.py to generate window functions
-"""
 
 def generate_subdomains(domain, n_sub_per_dim, overlap):
     """
@@ -50,125 +48,150 @@ def generate_subdomains(domain, n_sub_per_dim, overlap):
     return subdomains
 
 
-### Different sampling strategy
-# =================== 辅助函数 =================== #
-def scale_sample(samples: np.ndarray, domain):
+def _scale_sample(samples_01, domain):
     """
-    将在 [0,1]^2 上的采样点映射回给定的 domain = [(x_lo, y_lo), (x_hi, y_hi)].
+    把 [0,1]^d 的样本样本样本，缩放到给定 domain。
+    domain: list of (lo, hi)；其中 lo, hi 均为数值 (float) 或 np.float。
     """
-    (x_lo, y_lo), (x_hi, y_hi) = domain
-    return samples * np.array([x_hi - x_lo, y_hi - y_lo]) + np.array([x_lo, y_lo])
+    lows = np.array([lo for lo, _ in domain])  # shape (d,)
+    highs = np.array([hi for _, hi in domain])
+    return lows + samples_01 * (highs - lows)   # shape (N, d)
 
-def _van_der_corput(index, base=2):
+
+def _van_der_corput(n, base=2):
+    """1-D Van-der-Corput 序列，用于 Hammersley 2D 采样。"""
+    vdc, denom = 0.0, 1.0
+    while n:
+        denom *= base
+        n, remainder = divmod(n, base)
+        vdc += remainder / denom
+    return vdc
+
+
+def generate_collocation(
+    domain,
+    n_pts: int,
+    strategy: str = "random",
+    seed: int = None,
+    scramble: bool = False,
+):
     """
-    范德科蒙 (Van der Corput) 展开，将整数 index 映射为 [0,1] 之间的小数。
-    用于 Hammersley 序列等低差异采样。
+    在 d-维超长方体 domain 内生成 n_pts^d 个 collocation 点。返回 ndarray 形状 (n_pts^d, d)。
+
+    Args:
+        domain: 
+            - 1D 情况: (jnp.array([xmin]), jnp.array([xmax])) 
+            - 2D 及更高维: (jnp.array([xmin, ymin, ...]), jnp.array([xmax, ymax, ...]))
+            也可以传列表形式：[(xmin,xmax), (ymin,ymax), ...]，等价于上面数组版。
+        n_pts: 每个维度上的采样点数 (总点数 = n_pts**d)
+        strategy: "uniform"、"random"、"lhs"、"halton"、"sobol"、"hammersley"
+        seed: 随机种子 (仅对 "random"/"lhs"/"halton"/"sobol" 有效)
+        scramble: 是否对 Halton 或 Sobol 做 scramble
+
+    Returns:
+        pts: NumPy 数组，shape = (n_pts**d, d)，每行是一个 d 维采样坐标。
     """
-    result = 0.0
-    f = 1.0
-    i = index
-    while i > 0:
-        f /= base
-        result += f * (i % base)
-        i //= base
-    return result
+    # 1) 先把 domain 规范成列表 [(lo,hi), (lo,hi), ...] 形式
+    if isinstance(domain, tuple) and isinstance(domain[0], jnp.ndarray):
+        # numpy/jax 数组版，直接把单项归为列表
+        lo_arr, hi_arr = domain
+        lo_arr = jnp.asarray(lo_arr)
+        hi_arr = jnp.asarray(hi_arr)
+        assert lo_arr.shape == hi_arr.shape, "domain 两个数组必须同形状 (d,)"
+        d = lo_arr.shape[0]
+        domain_list = [(float(lo_arr[i]), float(hi_arr[i])) for i in range(d)]
+    elif isinstance(domain[0], (float, int, np.floating)):
+        # domain=(xmin,xmax) 1D
+        domain_list = [(float(domain[0]), float(domain[1]))]
+    else:
+        # domain 已经是 list-of-tuples 形式
+        domain_list = list(domain)
+        d = len(domain_list)
 
-# =================== 主函数：采样入口 =================== #
-def generate_collocation(domain, n_pts, strategy="random", seed=None, scramble=False):
-    """
-    根据 strategy 生成 n_pts^2 个二维采样点，返回 shape=(n_pts^2, 2).
-    可选的 strategy:
-        - "uniform"    : 均匀网格采样
-        - "random"     : 随机
-        - "lhs"        : Latin Hypercube
-        - "halton"     : Halton  (支持 scramble)
-        - "sobol"      : Sobol   (支持 scramble)
-        - "hammersley" : Hammersley
-    其余参数:
-        - seed       : 随机种子(对 random / lhs / halton / sobol 有效)
-        - scramble   : 是否扰动(对 halton / sobol 有效)
-    """
+    d = len(domain_list)
+    N = n_pts ** d
 
-    (x_lo, y_lo), (x_hi, y_hi) = domain
-    N = n_pts ** 2  # 采样总数
+    rng = np.random.default_rng(seed)
+    stg = strategy.lower()
 
-    # 根据 strategy 分支
-    if strategy.lower() == "uniform":
-        # 均匀网格
-        xs = np.linspace(x_lo, x_hi, n_pts)
-        ys = np.linspace(y_lo, y_hi, n_pts)
-        XX, YY = np.meshgrid(xs, ys, indexing='ij')
-        points = np.column_stack([XX.ravel(), YY.ravel()])
+    if stg == "uniform":
+        # 每维 n_pts 均匀节点 → meshgrid → 展平
+        axes = [np.linspace(lo, hi, n_pts) for lo, hi in domain_list]
+        mesh = np.meshgrid(*axes, indexing="ij")
+        pts = np.column_stack([m.ravel() for m in mesh])
 
-    elif strategy.lower() == "random":
-        # 随机采样
-        rng = np.random.default_rng(seed)
-        samples_01 = rng.random((N, 2))
-        points = scale_sample(samples_01, domain)
+    elif stg == "random":
+        samples_01 = rng.random((N, d))
+        pts = _scale_sample(samples_01, domain_list)
 
-    elif strategy.lower() == "lhs":
-        # Latin Hypercube
-        sampler = LatinHypercube(d=2, seed=seed)
+    elif stg == "lhs":
+        sampler = LatinHypercube(d=d, seed=seed)
         samples_01 = sampler.random(N)
-        points = scale_sample(samples_01, domain)
+        pts = _scale_sample(samples_01, domain_list)
 
-    elif strategy.lower() == "halton":
-        # Halton (可 scramble)
-        sampler = Halton(d=2, scramble=scramble, seed=seed)
+    elif stg == "halton":
+        sampler = Halton(d=d, scramble=scramble, seed=seed)
         samples_01 = sampler.random(N)
-        points = scale_sample(samples_01, domain)
+        pts = _scale_sample(samples_01, domain_list)
 
-    elif strategy.lower() == "sobol":
-        # Sobol (可 scramble)
-        sampler = Sobol(d=2, scramble=scramble, seed=seed)
-        samples_01 = sampler.random(N)
-        points = scale_sample(samples_01, domain)
+    elif stg == "sobol":
+        sampler = Sobol(d=d, scramble=scramble, seed=seed)
+        m = int(np.ceil(np.log2(N)))
+        samples_01 = sampler.random(2 ** m)[:N]
+        pts = _scale_sample(samples_01, domain_list)
 
-    elif strategy.lower() == "hammersley":
-        # Hammersley
-        points_01 = np.zeros((N, 2))
+    elif stg == "hammersley":
+        if d != 2:
+            raise NotImplementedError("Hammersley 仅支持 2D。")
+        pts_01 = np.zeros((N, 2))
         for i in range(N):
-            points_01[i, 0] = i / N
-            points_01[i, 1] = _van_der_corput(i, base=2)
-        points = scale_sample(points_01, domain)
+            pts_01[i, 0] = i / N
+            pts_01[i, 1] = _van_der_corput(i, base=2)
+        pts = _scale_sample(pts_01, domain_list)
 
     else:
-        raise ValueError(f"Unknown strategy={strategy}. Choose from "
-                         f"['uniform','random','lhs','halton','sobol','hammersley'].")
+        raise ValueError(
+            f"Unknown strategy='{strategy}'. "
+            "请从 ['uniform','random','lhs','halton','sobol','hammersley'] 中选择。"
+        )
 
-    return points
+    return pts
+
 
 # =================== 测试 & 可视化 =================== #
 if __name__ == "__main__":
-    domain = ((0, 0), (1, 1))
-    n_pts  = 4  # 采样 4^2=16 个点，方便可视化
+    # ---------- 测试 generate_subdomains ----------
+    domain_1d = (jnp.array([0.0]), jnp.array([1.0]))  # 1D
+    subs_1d = generate_subdomains(domain_1d, n_sub_per_dim=4, overlap=0.2)
+    print("1D 子域数量:", len(subs_1d), "示例：", subs_1d[:2])
 
-    # 不同采样方式
-    strategies = [
-        "uniform",
-        "random",
-        "lhs",
-        "halton",
-        "sobol",
-        "hammersley"
-    ]
+    domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))  # 2D
+    subs_2d = generate_subdomains(domain_2d, n_sub_per_dim=[3, 2], overlap=0.1)
+    print("2D 子域数量:", len(subs_2d), "示例：", subs_2d[:2])
 
-    # 生成并打印
-    for stg in strategies:
-        pts = generate_collocation(domain, n_pts, strategy=stg, seed=42, scramble=False)
-        print(f"\nStrategy: {stg}")
-        print(pts)
+    # ---------- 测试 generate_collocation ----------
+    # 1D 情况
+    pts1d = generate_collocation((jnp.array([0.0]), jnp.array([1.0])), n_pts=5, strategy="uniform")
+    print("1D 均匀 5 点, 形状:", pts1d.shape, pts1d[:5])
 
-    # 画图对比
+    # 2D 情况：数组形式
+    pts2d_arr = generate_collocation((jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0])), n_pts=5, strategy="uniform")
+    print("2D 数组域 均匀 5×5, 形状:", pts2d_arr.shape, pts2d_arr[:5])
+
+    # 2D 情况：列表形式
+    pts2d_list = generate_collocation([(0.0, 0.0), (1.0, 1.0)], n_pts=5, strategy="random", seed=42)
+    print("2D 列表域 随机 5×5, 形状:", pts2d_list.shape, pts2d_list[:5])
+
+    # 可视化对比（任选一种）
+    import matplotlib.pyplot as plt
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), sharex=True, sharey=True)
-
+    strategies = ["uniform", "random", "lhs", "halton", "sobol", "hammersley"]
     for ax, stg in zip(axes.flat, strategies):
-        pts = generate_collocation(domain, n_pts, strategy=stg, seed=42, scramble=False)
-        ax.scatter(pts[:, 0], pts[:, 1], s=30, alpha=0.7, edgecolors='k')
+        pts = generate_collocation((jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0])), n_pts=8, strategy=stg, seed=42)
+        ax.scatter(pts[:, 0], pts[:, 1], s=20, alpha=0.7, edgecolors='k')
         ax.set_title(stg.capitalize())
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.set_aspect("equal", adjustable="box")
-
     plt.tight_layout()
     plt.show()

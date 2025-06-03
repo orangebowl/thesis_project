@@ -15,10 +15,12 @@ import matplotlib.pyplot as plt
 import jax.numpy as jnp
 import jax
 import matplotlib.pyplot as plt
-from utils.window_function import my_window_func
+from utils.window_function import cosine
+
+my_window_func = cosine
 
 def plot_subdomain_partials(model, x_test, u_true, save_dir):
-    #print("[DEBUG] plot_subdomain_partials is called.")
+
     total_with_ansatz = []
 
     for i in range(len(model.subnets)):

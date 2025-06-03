@@ -18,7 +18,8 @@ class PDEProblem:
 
 class CosineODE(PDEProblem):
     omega  = 15.0
-    domain = (-2 * jnp.pi, 2 * jnp.pi)
+    domain = (jnp.array([-2*jnp.pi]),   
+          jnp.array([2*jnp.pi]))   
 
     # Ansatz (hard contraint)
     @staticmethod
@@ -199,59 +200,90 @@ class Poisson2D(PDEProblem):
         
 class Poisson2D_freq(PDEProblem):
     """
-    2-D Poisson problem on Ω = [0,1]²
+    2-D Poisson problem on Ω = [0,1]^2
         -Δu = f(x, y),     u|_{∂Ω} = 0
     Exact solution (for testing):
         u(x,y) = sin(2π x²) * sin(2π y²)
     """
 
-    domain = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))  # 2D
+    # 2-D domain 用一对 length-2 的 JAX arrays 表示
+    domain = (jnp.array([0.0, 0.0]),   #  x_min = 0 , y_min = 0
+          jnp.array([1.0, 1.0]))   #  x_max = 1 , y_max = 1
 
     @staticmethod
     def exact(xy):
-        x, y = xy[..., 0], xy[..., 1]
+        """
+        支持 xy 为 (2,) 或 (...,2)；返回对应形状的 u(x,y)。
+        """
+        xy = jnp.atleast_1d(xy)         # 处理 0-D 或 (2,) 的情况
+        x  = xy[..., 0]
+        y  = xy[..., 1]
         return jnp.sin(2 * jnp.pi * x**2) * jnp.sin(2 * jnp.pi * y**2)
 
     @staticmethod
     def ansatz(xy, nn_out):
-        # 强制边界为 0 ⇒ x(1-x)*y(1-y)
-        x = xy[..., 0]
-        y = xy[..., 1]
-        factor = x*(1 - x)*y*(1 - y)  # (N,)
-        factor = factor[..., None]    # (N,1)
-        return factor*nn_out         # (N,1)
+        """
+        让 u 在边界上自动为 0：factor = x(1-x)*y(1-y)
+        支持 xy 为 (2,)、(N,2) 或更高维度 (...,2)。
+        """
+        xy = jnp.atleast_1d(xy)
+        x  = xy[..., 0]
+        y  = xy[..., 1]
+        factor = x * (1 - x) * y * (1 - y)  # shape (...,)
+        factor = factor[..., None]         # shape (...,1)
+        return factor * nn_out             # shape (...,1)
 
     @staticmethod
     def rhs(xy):
+        """
+        Right-hand side f(x,y) = -Δ u_true(x,y).
+        支持 xy 为 (2,) 或 (...,2)。
+        """
+        xy = jnp.atleast_1d(xy)
         x, y = xy[..., 0], xy[..., 1]
         sin_x2 = jnp.sin(2 * jnp.pi * x**2)
         sin_y2 = jnp.sin(2 * jnp.pi * y**2)
         cos_x2 = jnp.cos(2 * jnp.pi * x**2)
         cos_y2 = jnp.cos(2 * jnp.pi * y**2)
+        # 计算 -Δ(sin(2πx²)sin(2πy²))
         term1 = -4 * jnp.pi * (sin_y2 * cos_x2 + sin_x2 * cos_y2)
-        term2 = 16 * (jnp.pi**2)*(x**2 + y**2)*sin_x2*sin_y2
-        return term1 + term2
+        term2 = 16 * (jnp.pi**2) * (x**2 + y**2) * sin_x2 * sin_y2
+        return term1 + term2  # shape (...,)
 
     def _single_res(self, model, xy_batch):
-        """Residual = mean(( -laplacian(u) - f )^2) over xy_batch."""
+        """
+        计算 R = mean[ ( -Δu_nn(xy) - f(xy) )^2 ] over xy_batch。
+        xy_batch 必须是形如 (N,2)；若传 scalar 或 (2,), 会先 at_least_2d。
+        """
+        # 保证批量为二维数组 (N,2)，避免后续索引越界
+        xy_batch = jnp.atleast_2d(xy_batch)  # shape (N,2)
+
         if xy_batch.shape[0] == 0:
             return 0.0
 
         def u_fn(pt_2d):
-            out = model(pt_2d)  # shape=(1,1) or scalar
+            """
+            单点前向：pt_2d 形如 (2,) 或更低维度，但通过 at_least_1d 强制成 (2,).
+            """
+            pt_2d = jnp.atleast_1d(pt_2d)
+            out = model(pt_2d)         # 可能返回 (1,1) 或 标量
             return out.squeeze()
 
+        # Hessian 操作：对 u_fn 求二阶导
         hessian_fn = jax.jacfwd(jax.jacrev(u_fn))
+        # 对整个批量并行计算 Hessian(pt) —— shape=(N,2,2)
         hessians   = jax.vmap(hessian_fn)(xy_batch)
-        laplacians = jnp.trace(hessians, axis1=-2, axis2=-1)
-        f_vals = self.rhs(xy_batch)
-        return jnp.mean( ( -laplacians - f_vals )**2 )
+        # 拉普拉斯是 Hessian 对角线之和
+        laplacians = jnp.trace(hessians, axis1=-2, axis2=-1)  # shape=(N,)
+        f_vals = self.rhs(xy_batch)                           # shape=(N,)
+
+        # 均方残差
+        return jnp.mean(( -laplacians - f_vals ) ** 2)
 
     def residual(self, model, xy):
         """
-        xy 若是 (N,2) => single batch,
-           若是 list => stack后处理,
-           若是 (n_sub,Nx,2) => for each sub batch.
-        这里简化，直接 single batch => (N,2).
+        统一入口：接受任意形状 xy——如果是标量或 (2,), 会在 _single_res 里自动 at_least_2d。
+        如果想做分子域残差，调用者可先分割后传进来。
         """
         return self._single_res(model, xy)
+
