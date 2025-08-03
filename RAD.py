@@ -1,4 +1,3 @@
-# rad_train.py  --------------------------------------------------------
 """
 Residual-based Adaptive sampling (RAD) demo with tqdm progress bar.
 """
@@ -30,8 +29,8 @@ def pointwise_residual(pde, model, xy):
 # ---------------------------------------------------------------------
 # RAD 采样
 # ---------------------------------------------------------------------
-def rad_sample(key, pde, model, *, n_draw, pool_size, k=1.0, c=1.0):
-    pool_size = max(pool_size, n_draw * 2)
+def rad_sample(key, pde, model, *, n_draw, pool_size, k=3.0, c=1.0):
+    #pool_size = max(pool_size, n_draw * 2)
     (lo, hi)  = pde.domain
     kx, ky, key = jax.random.split(key, 3)
     xs = jax.random.uniform(kx, (pool_size,),
@@ -46,16 +45,32 @@ def rad_sample(key, pde, model, *, n_draw, pool_size, k=1.0, c=1.0):
     idx  = jax.random.choice(key, pool_size, (n_draw,), p=prob, replace=False)
     return pool[idx]
 
-# ---------------------------------------------------------------------
-# RAD-style 训练
-# ---------------------------------------------------------------------
+# Plot help 
+# plot the collocation points at each stage
+def plot_colloc_points(colloc, domain, stage_id, save_dir="results"):
+    """
+    在给定的二维区域 domain 上，绘制 colloc 点分布，并以 stage_id 结尾保存图片。
+    """
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    plt.figure()
+    plt.scatter(colloc[:, 0], colloc[:, 1], s=10, alpha=0.5, edgecolors='k')
+    plt.xlim(domain[0][0], domain[1][0])
+    plt.ylim(domain[0][1], domain[1][1])
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.title(f"Stage {stage_id + 1} Collocation Points (RAD)")
+    plt.savefig(os.path.join(save_dir, f"rad_colloc_stage_{stage_id + 1}.png"))
+    plt.close()
+
+#FBPINN training with RAD
 def train_fbpinn_rad(
     *, key, pde, fbmodel,
     stages, steps_per_stage, n_init, n_rad, pool_size, xdim,
     lr=1e-3, eval_every=200,
 ):
     # 初始均匀采样
-    colloc = generate_collocation(pde.domain, n_init, "uniform")
+    colloc = generate_collocation(pde.domain, n_init, "halton")
     opt    = optax.adam(lr)
     opt_st = opt.init(eqx.filter(fbmodel, eqx.is_array))
 
@@ -70,11 +85,11 @@ def train_fbpinn_rad(
         return model, opt_state, loss_val
 
     def l1(model):
-        pts = generate_collocation(pde.domain, 40, "uniform")
+        pts = generate_collocation(pde.domain, 80, "grid")
         return jnp.mean(jnp.abs(model(pts).squeeze() - pde.exact(pts)))
 
     total_steps = stages * steps_per_stage
-    loss_hist, l1_hist, l1_steps = [], [], []
+    loss_hist, l1_steps, l1_hist = [], [], []
     stage_boundary = steps_per_stage     # 下一次重采样的 step 编号
     stage_id = 0
 
@@ -83,7 +98,6 @@ def train_fbpinn_rad(
         fbmodel, opt_st, loss_val = step(fbmodel, opt_st, colloc)
         loss_hist.append(loss_val)
 
-        # ----- 每 eval_every 步评估一次 L1 ----- #
         if (global_step + 1) % eval_every == 0 or global_step == total_steps - 1:
             l1_val = float(l1(fbmodel))
             l1_hist.append(l1_val)
@@ -99,6 +113,9 @@ def train_fbpinn_rad(
                 sub, pde, fbmodel,
                 n_draw=n_rad ** xdim, pool_size=pool_size
             )
+            # 画出此阶段采样到的新 colloc 点分布
+            plot_colloc_points(colloc, pde.domain, stage_id, save_dir="results")
+
             stage_id += 1
             stage_boundary += steps_per_stage
 
@@ -117,7 +134,7 @@ def main():
     mlp_c = dict(in_size=xdim, out_size=1, width_size=64, depth=2,
                  activation=jax.nn.tanh)
 
-    key = jax.random.PRNGKey(123)
+    key = jax.random.PRNGKey(1)
     fb  = FBPINN(
         key              = key,
         subdomains       = subdomains,
@@ -132,18 +149,18 @@ def main():
         key             = key,
         pde             = problem,
         fbmodel         = fb,
-        stages          = 4,
-        steps_per_stage = 5000,
+        stages          = 10,
+        steps_per_stage = 3000,
         n_init          = 50,
         n_rad           = 50,
-        pool_size       = 5000,          # 自动扩展
+        pool_size       = 10000,          # 自动扩展
         xdim            = xdim,
         lr              = 1e-3,
         eval_every      = 200,
     )
 
-    # ---------- 可视化 ----------
-    Nx = Ny = 50
+    # ---------- 可视化最终预测结果 ---------- #
+    Nx = Ny = 80
     gx = jnp.linspace(domain[0][0], domain[1][0], Nx)
     gy = jnp.linspace(domain[0][1], domain[1][1], Ny)
     mesh = jnp.stack(jnp.meshgrid(gx, gy, indexing="ij"), -1)
@@ -152,13 +169,13 @@ def main():
     u_pred  = model(grid).reshape(Nx, Ny)
     u_exact = problem.exact(grid).reshape(Nx, Ny)
 
-    visualize_2d(
+    visualize_2d(model,
         gx, gy, u_pred, u_exact,
         loss_hist, l1_steps, l1_hist,
         save_dir="results", title_prefix="RAD-FBPINN"
     )
 
     print("Figures saved to ./results")
-
+    
 if __name__ == "__main__":
     main()

@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import optax
 import dataclasses
 from model.POU_nets import BasePOUNet
-from vis.vis_pou import _viz_partitions
+from vis.vis_pou import viz_partitions
+
 
 # --------- 多项式设计矩阵 & 局部拟合 ----------------------------------
 def _design_matrix(x: jnp.ndarray) -> jnp.ndarray:
@@ -42,13 +43,14 @@ def _predict_from_coeffs(x, coeffs, partitions):
 
 @dataclasses.dataclass
 class LSGDConfig:
-    n_epochs:   int   = 6000
-    lr:         float = 1e-3
-    lam_init:   float = 1e-3
-    rho:        float = 0.99
-    n_stag:     int   = 200
-    prints:     int   = 10
-    viz_int:    int|None = 500   # None=不画
+    n_epochs: int   = 5000
+    lr: float       = 1e-3
+    lam_init: float = 5e-4
+    rho: float      = 0.99
+    n_stag: int     = 100
+    prints: int     = 10
+    viz_int: int = 200   # None = no plot
+
 
 def run_lsgd(model: BasePOUNet, params: dict, x, y, cfg: LSGDConfig):
     lam = jnp.array(cfg.lam_init)
@@ -60,15 +62,15 @@ def run_lsgd(model: BasePOUNet, params: dict, x, y, cfg: LSGDConfig):
         part   = model.forward(p, x)
         coeffs = fit_local_polynomials(x, y, part, lam_)
         pred   = _predict_from_coeffs(x, coeffs, part)
-        return jnp.mean((pred-y)**2)
+        return jnp.mean((pred - y)**2)
 
     valgrad = jax.jit(lambda p, l: jax.value_and_grad(
         lambda pp: loss_fn(pp,l))(p))
 
     opt = optax.adam(cfg.lr); opt_state = opt.init(params)
 
-    print("⏳ compiling... ", end="", flush=True)
-    loss_val, grads = valgrad(params, lam); print("done")
+    print(" JIT compiling ...", end="", flush=True)
+    loss_val, grads = valgrad(params, lam); print(" done")
 
     for ep in range(cfg.n_epochs):
         updates, opt_state = opt.update(grads, opt_state)
@@ -76,12 +78,12 @@ def run_lsgd(model: BasePOUNet, params: dict, x, y, cfg: LSGDConfig):
         loss_val, grads = valgrad(params, lam)
 
         if cfg.viz_int and ep % cfg.viz_int == 0:
-            _viz_partitions(model, params, title=f"epoch {ep}")
+            viz_partitions(model, params, title=f"epoch {ep}")
 
         if ep % log_int == 0:
             print(f"epoch {ep:6d} | loss {loss_val:.6e} | λ={float(lam):.1e}")
 
-        # early-stop / λ 衰减
+        # λ decay
         if loss_val < best - 1e-12:
             best, stag = loss_val, 0
         else:

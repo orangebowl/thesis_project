@@ -23,7 +23,12 @@ pipeline
 outputs
 visualizations
 ResNet2D
-
+ckpts
+plot_help
+pou_fbpinn_results
+thesis_results
+results
+notebook
 # Ignore VSCode settings
 .vscode/
 

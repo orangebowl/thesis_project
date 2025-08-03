@@ -68,7 +68,8 @@ def train_single(
             loss_list.append(loss_val)
 
             # Calculate test L1 error at intervals
-            if x_test is not None and u_exact is not None and (batch_idx % 10 == 0 or i == steps - 1):
+            eval_every = 100            # 每 100 个外层 step 评一次
+            if x_test is not None and u_exact is not None and (i % eval_every == 0 or i == steps - 1):
                 u_test_exact = u_exact(x_test)
                 l1_error = float(compute_l1(model, x_test, u_test_exact))
                 l1_list.append(l1_error)

@@ -62,8 +62,8 @@ def plot_subdomain_partials(model, x_test, u_true, save_dir=None):
     w_all = _cosine(
         model.xmins_all,      # (ns,1)
         model.xmaxs_all,      # (ns,1)
-        model.wmins_fixed,    # (ns,1)
-        model.wmaxs_fixed,    # (ns,1)
+        model.wmins_all_fixed,    # (ns,1)
+        model.wmaxs_all_fixed,    # (ns,1)
         x_in                  # (N,1)
     )  # 返回 (N, ns)
 
@@ -155,31 +155,67 @@ def plot_test_l1_curve(test_steps, test_l1, save_dir=None):
 # -------------------------------------------------
 def plot_window_weights(x, subdomains_list, overlap, save_dir=None):
     """
-    在 1D 下绘制所有子域的窗口函数权重。
+    在 1D 下绘制所有子域的窗口函数权重，并在底部标出子域和 overlap 区域。
     x: 一维坐标 (N,)
-    subdomains_list: list[(left, right)]，left/right 均为 shape (1,) 的数组
+    subdomains_list: list of (left, right)，每个是 shape (1,) 的数组
     overlap: float，子域 overlap ratio（用来生成 wmins, wmaxs）
     """
     _ensure_dir(save_dir)
 
-    # 将 subdomains_list 转成两个数组 (ns,1)
     xmins = jnp.stack([s[0] for s in subdomains_list])  # (ns,1)
     xmaxs = jnp.stack([s[1] for s in subdomains_list])  # (ns,1)
-    wmins = jnp.full((len(subdomains_list), 1), overlap) # (ns,1)
-    wmaxs = jnp.full((len(subdomains_list), 1), overlap) # (ns,1)
+    wmins = jnp.full((len(subdomains_list), 1), overlap)
+    wmaxs = jnp.full((len(subdomains_list), 1), overlap)
 
-    # 计算窗口权重，_cosine 签名： (xmins_all, xmaxs_all, wmins_all, wmaxs_all, x_batch)
     x_in = x[:, None]  # (N,1)
     w_all = _cosine(xmins, xmaxs, wmins, wmaxs, x_in)  # (N, ns)
 
-    plt.figure()
+    # 绘图
+    fig, ax = plt.subplots(figsize=(10, 4))
     for i in range(w_all.shape[1]):
-        plt.plot(x, w_all[:, i], label=f"w{i}")
-    plt.title("Window weights"); plt.grid(ls=":"); plt.legend()
+        ax.plot(x, w_all[:, i])
+
+    ax.set_title("Window weights")
+    ax.grid(ls=":")
+
+
+    # --- 在图下方添加子域和 overlap 可视化 ---
+    y_bottom = -0.2  # y轴上的位置略低
+    height = 0.08    # 色块高度
+
+    for i, (xmin, xmax) in enumerate(zip(xmins, xmaxs)):
+        xmin = float(xmin[0])
+        xmax = float(xmax[0])
+        width = xmax - xmin
+        ov = width * float(overlap)
+
+        # 主子域区域（不含 overlap）：灰色（排除左右 overlap）
+        ax.add_patch(plt.Rectangle(
+            (xmin + ov, y_bottom), width - 2 * ov, height,
+            facecolor='lightgray', edgecolor='k', alpha=0.5
+        ))
+
+        # 左侧 overlap
+        ax.add_patch(plt.Rectangle(
+            (xmin, y_bottom), ov, height,
+            facecolor='salmon', edgecolor='none', alpha=0.5
+        ))
+
+        # 右侧 overlap
+        ax.add_patch(plt.Rectangle(
+            (xmax - ov, y_bottom), ov, height,
+            facecolor='salmon', edgecolor='none', alpha=0.5
+        ))
+    # 添加标注
+    ax.text(x[0], y_bottom - 0.07, 'gray = subdomain, red = overlap', fontsize=8)
+
+    # 调整 ylim 保证色块可见
+    ax.set_ylim(y_bottom - 0.15, 1.05)
 
     if save_dir:
         path = os.path.join(save_dir, "window_weights.png")
-        plt.savefig(path, dpi=150); plt.close()
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
         return path
 
 # -------------------------------------------------
@@ -257,13 +293,14 @@ def visualize_1d(
         fb_model      = subdomains["model"]
         subdomains_list = subdomains["list"]
 
-        # (4.1) 子域贡献
-        paths["subdomain_partials"] = plot_subdomain_partials(
-            model    = fb_model,
-            x_test   = x_test,
-            u_true   = u_true,
-            save_dir = save_dir,
-        )
+        # (4.1) 检查是否有 subnets 属性，只有在 fb_model 是 FBPINN 时才画子域贡献图
+        if hasattr(fb_model, 'subnets'):
+            paths["subdomain_partials"] = plot_subdomain_partials(
+                model    = fb_model,
+                x_test   = x_test,
+                u_true   = u_true,
+                save_dir = save_dir,
+            )
 
         # (4.2) 窗口函数权重
         paths["window_weights"] = plot_window_weights(
@@ -279,6 +316,7 @@ def visualize_1d(
     )
 
     return paths
+
 
 # -------------------------------------------------
 # 7. 导出符号

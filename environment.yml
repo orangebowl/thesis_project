@@ -1,0 +1,22 @@
+name: jax_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - numpy
+  - scipy
+  - matplotlib
+  - pip
+  - tqdm
+  - setuptools
+  - wheel
+  - pip:
+      - jax[cuda12_pjrt] @ https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      - jaxlib==0.4.30
+      - chex
+      - optax
+      - equinox
+      - jaxtyping
+      - absl-py
+      - toolz

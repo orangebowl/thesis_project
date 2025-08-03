@@ -1,100 +1,95 @@
-import os
-import sys
-import yaml
-import importlib
 import jax
 import jax.numpy as jnp
 import optax
 import equinox as eqx
-
-# add path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-# import the model
-from model.fbpinn_model import FBPINN
-# import some data utils functions
-from utils.data_utils import generate_collocation, generate_subdomains
-# import some visualization functions
-from utils.visualizer import (
-    plot_prediction_vs_exact,
-    plot_training_loss,
-    plot_test_l1_curve,
-    plot_window_weights,
-    save_training_stats,
-    plot_subdomain_partials
-)
 from tqdm import trange
+from typing import Callable, Optional
 
-
-# train_fbpinn_global.py
-import os, jax, jax.numpy as jnp, optax, equinox as eqx
-from tqdm import trange
-
-
-@eqx.filter_jit
-def _step(model, opt_state, colloc_full, optimizer):
-    if colloc_full.shape[0] == 0:
-        return model, opt_state, jnp.array(0.0)
-
-    # 直接用 residual_fn 计算 loss
-    def loss_fn(m):
-        res_sq = jax.vmap(m.residual_fn, (None, 0))(m, colloc_full)
-        return jnp.mean(res_sq)
-
-    loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model)
-    updates, opt_state = optimizer.update(grads, opt_state, model)
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss_val
-
-
-# ------------------ L1 误差评估 ------------------ #
-@eqx.filter_jit
-def compute_l1(model, x_test, u_test_exact):
-    pred = model(x_test).squeeze()
-    return jnp.mean(jnp.abs(pred - u_test_exact.squeeze()))
-
-
-# ------------------- 主训练循环 ------------------- #
 def train_fbpinn(
-    *,
-    model:       eqx.Module,
-    colloc_full: jax.Array,            # (N_total, xdim) —— 全域采样
-    steps:       int,
-    lr:          float,
-    x_test:      jax.Array  = None,
-    u_exact:     callable   = None,
-    save_dir:    str        = None,
-    checkpoint_every: int   = 0,
+    *, 
+    key: jax.random.PRNGKey, 
+    model: eqx.Module, 
+    problem,
+    colloc: jax.Array, 
+    lr: float = 3e-4, 
+    steps: int = 10_000,
+    x_test: Optional[jax.Array] = None,
+    u_exact: Optional[Callable[[jax.Array], jax.Array]] = None,
+    eval_every: int = 100
 ):
-    """FBPINN 训练（全域 collocation 版）"""
-    # 1) 优化器
+
+    colloc = colloc.astype(jnp.float32)
+
+    # 将模型分区为可训练参数 (params) 和静态数据 (static)
+    params, static = eqx.partition(model, eqx.is_array)
+
+    # 辅助函数，用于根据当前参数重建模型
+    def build_model(p):
+        return eqx.combine(p, static)
+
+    # 损失函数现在只需要可训练参数，因为`static`已从外部作用域捕获
+    def loss_fn(p, xy):
+        return problem.residual(build_model(p), xy)
+
+    @eqx.filter_jit
+    def eval_fn(p):
+        """JIT编译的评估函数，用于在测试集上计算L1误差。"""
+        if x_test is None or u_exact is None:
+            return jnp.nan
+        
+        full_model = build_model(p)
+        pred = full_model(x_test.astype(jnp.float32)).squeeze()
+        exact = u_exact(x_test).squeeze()
+        return jnp.mean(jnp.abs(pred - exact))
+
+    # 初始化 Adam 优化器
     optimizer = optax.adam(lr)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    opt_state = optimizer.init(params)
 
-    # 2) 历史记录
-    loss_hist, l1_hist, l1_steps = [], [], []
-    pbar = trange(steps, desc="FBPINN", dynamic_ncols=True)
+    @eqx.filter_jit
+    def step_fn(p, o, xy_full):
+        """
+        在整个数据集上执行单次JIT编译的训练步骤。
+        """
+        # 如果数据是按子域划分的，则将其展平以便处理
+        if xy_full.ndim > 2:
+            xy_full = xy_full.reshape(-1, xy_full.shape[-1])
+        
+        # 一次性在整个数据集上计算损失和梯度
+        loss_val, grads = jax.value_and_grad(loss_fn)(p, xy_full)
+        
+        # 应用优化器更新
+        updates, o = optimizer.update(grads, o, p)
+        p = eqx.apply_updates(p, updates)
+        
+        return p, o, loss_val
 
-    # 3) 训练循环
-    for step in pbar:
-        model, opt_state, loss = _step(model, opt_state,
-                                       colloc_full, optimizer)
-        loss_val = float(loss); loss_hist.append(loss_val)
+    # --- 训练循环 ---
+    print("JIT 编译完整模型的训练步骤... (这可能需要很长时间)")
+    
+    # 使用一小部分数据预编译，以避免在编译期间进行大的内存分配
+    # 结构是相同的，所以编译好的函数将适用于完整数据
+    _colloc_flat = colloc.reshape(-1, colloc.shape[-1])
+    if _colloc_flat.shape[0] > 0:
+        step_fn(params, opt_state, _colloc_flat[:1])
+    print("编译完成。")
 
-        # 定期评估 L1
-        if x_test is not None and (step % 100 == 0 or step == steps - 1):
-            u_test_exact = u_exact(x_test)
-            l1 = float(compute_l1(model, x_test, u_test_exact))
-            l1_hist.append(l1); l1_steps.append(step)
-            pbar.set_postfix(loss=f"{loss_val:.2e}", l1=f"{l1:.2e}")
+    loss_history, l1_history, l1_steps = [], [], []
+    
+    bar = trange(steps, dynamic_ncols=True, desc="FBPINN 训练 (All Active)")
+    for s in bar:
+        params, opt_state, loss_val = step_fn(params, opt_state, colloc)
+        loss_history.append(float(loss_val))
+
+        # 周期性地评估并记录L1误差
+        if (s + 1) % eval_every == 0 or s + 1 == steps:
+            l1_error = float(eval_fn(params))
+            l1_history.append(l1_error)
+            l1_steps.append(s + 1)
+            bar.set_postfix(loss=f"{loss_val:.3e}", L1=f"{l1_error:.3e}")
         else:
-            pbar.set_postfix(loss=f"{loss_val:.2e}")
+            bar.set_postfix(loss=f"{loss_val:.3e}")
 
-        # checkpoint
-        if checkpoint_every and save_dir and (step + 1) % checkpoint_every == 0:
-            os.makedirs(save_dir, exist_ok=True)
-            eqx.tree_serialise_leaves(
-                os.path.join(save_dir, f"ckpt_{step + 1}.eqx"), model
-            )
-
-    return model, jnp.array(loss_hist), (jnp.array(l1_steps), jnp.array(l1_hist))
+    # 返回最终训练好的模型和记录的历史数据
+    final_model = build_model(params)
+    return final_model, jnp.array(loss_history), (jnp.array(l1_steps), jnp.array(l1_history))

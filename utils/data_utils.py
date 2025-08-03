@@ -4,47 +4,89 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.stats.qmc import LatinHypercube, Halton, Sobol
 
-def generate_subdomains(domain, n_sub_per_dim, overlap):
+def generate_subdomains(
+    domain,
+    overlap,
+    centers_per_dim=None,      # list[array]  or None
+    n_sub_per_dim=None,        # int | list[int] | None
+    widths_per_dim=None,       # list[array|scalar] | None
+):
     """
-    Generate uniformly spaced subdomains (with overlap) in 1D or multi-D.
-
-    Args:
-        domain: tuple of (lower_bounds: jnp.array, upper_bounds: jnp.array), shape (d,)
-        n_sub_per_dim: int or list of ints for each dim
-        overlap: float (relative size, e.g., 0.2)
-
-    Returns:
-        subdomains: list of (left: jnp.array, right: jnp.array)
+    生成 [(left, right), ...] 子域区间列表，支持：
+      • 均匀中心  ——  n_sub_per_dim
+      • 自定义中心 ——  centers_per_dim
+      • 每维宽度  ——  widths_per_dim 可给标量或一维数组
     """
-    if isinstance(n_sub_per_dim, int):
-        n_sub_per_dim = [n_sub_per_dim] * len(domain[0])  # scalar → list
+    lowers, uppers = map(jnp.asarray, domain)
+    dim = lowers.size
 
-    dim = len(domain[0])
-    grid_axes = []
-    step_sizes = []
-    for i in range(dim):
-        a, b = domain[0][i], domain[1][i]
-        n = n_sub_per_dim[i]
-        total_len = b - a
-        step = total_len / (n-1)
-        #centers = jnp.linspace(a + step / 2, b - step / 2, n)
-        centers = jnp.linspace(a, b, n)
-        print("centers",centers)
-        grid_axes.append(centers)
-        step_sizes.append(step)
+    # ---------- 1. 生成中心 ----------
+    if centers_per_dim is not None:
+        axes = [jnp.asarray(c) for c in centers_per_dim]
+    else:
+        if isinstance(n_sub_per_dim, int):
+            n_sub_per_dim = [n_sub_per_dim] * dim
+        step = (uppers - lowers) / (jnp.array(n_sub_per_dim) - 1)
+        axes = [
+            jnp.linspace(lowers[i], uppers[i], int(n_sub_per_dim[i]))
+            for i in range(dim)
+        ]
 
-    mesh = jnp.meshgrid(*grid_axes, indexing='ij')  # multi-D center coords
-    center_points = jnp.stack([m.reshape(-1) for m in mesh], axis=-1)  # (n_sub_total, d)
+    mesh = jnp.meshgrid(*axes, indexing="ij")                # 每个元素形状 (n0,n1,…)
+    centers = jnp.stack([m.ravel() for m in mesh], axis=-1)  # (N, dim)
 
-    subdomains = []
-    for center in center_points:
-        width = jnp.array(step_sizes)/2 + overlap/2 # half
-        left = center - width
-        right = center + width
-        #left = center - width / 2
-        #right = center + width / 2
-        subdomains.append((left, right))
+    grid_shape = mesh[0].shape                               # 基础形状
+    N = centers.shape[0]
 
+    # ---------- 2. half_width: broadcast 到整网格 ----------
+    half_cols = []
+    if widths_per_dim is not None:
+        if len(widths_per_dim) != dim:
+            raise ValueError("widths_per_dim 长度必须等于维度数")
+        for d, w in enumerate(widths_per_dim):
+            w_arr = jnp.asarray(w)
+
+            # --- 标量 → 全域同值
+            if w_arr.ndim == 0:
+                w_full = jnp.full(grid_shape, w_arr)
+
+            # --- 一维：长度必须与该维轴相同，reshape+broadcast
+            elif w_arr.ndim == 1:
+                if w_arr.shape[0] != axes[d].shape[0]:
+                    raise ValueError(
+                        f"widths_per_dim[{d}] 长度 {w_arr.shape[0]} "
+                        f"与该维中心数 {axes[d].shape[0]} 不一致"
+                    )
+                shape = [1] * dim
+                shape[d] = -1
+                w_full = jnp.broadcast_to(w_arr.reshape(shape), grid_shape)
+
+            # --- 已给 full grid：形状必须完全匹配
+            else:
+                if w_arr.shape != grid_shape:
+                    raise ValueError(
+                        f"widths_per_dim[{d}] 形状 {w_arr.shape} "
+                        f"必须是标量 / 一维 / {grid_shape}"
+                    )
+                w_full = w_arr
+
+            half_cols.append((w_full / 2.0).ravel())
+
+    else:
+        # === 未显式给 widths_per_dim ===
+        if centers_per_dim is None:
+            # 均匀网格：step + overlap
+            step = (uppers - lowers) / (jnp.array(n_sub_per_dim) - 1)
+            default_w = jnp.broadcast_to(step + overlap, (N, dim)) / 2.0
+            half_cols = [default_w[:, d] for d in range(dim)]
+        else:
+            # 自定义中心：常数 overlap
+            half_cols = [jnp.full(N, overlap / 2.0) for _ in range(dim)]
+
+    half_width = jnp.stack(half_cols, axis=-1)                # (N, dim)
+
+    # ---------- 3. 组装 ----------
+    subdomains = [(c - hw, c + hw) for c, hw in zip(centers, half_width)]
     return subdomains
 
 
@@ -71,56 +113,46 @@ def _van_der_corput(n, base=2):
 def generate_collocation(
     domain,
     n_pts: int,
-    strategy: str = "random",
+    strategy: str = "grid",       # default grid
     seed: int = None,
     scramble: bool = False,
 ):
     """
-    在 d-维超长方体 domain 内生成 n_pts^d 个 collocation 点。返回 ndarray 形状 (n_pts^d, d)。
+    在 d 维超长方体内生成 n_pts^d 个 collocation 点，返回 ndarray (n_pts^d, d)。
 
-    Args:
-        domain: 
-            - 1D 情况: (jnp.array([xmin]), jnp.array([xmax])) 
-            - 2D 及更高维: (jnp.array([xmin, ymin, ...]), jnp.array([xmax, ymax, ...]))
-            也可以传列表形式：[(xmin,xmax), (ymin,ymax), ...]，等价于上面数组版。
-        n_pts: 每个维度上的采样点数 (总点数 = n_pts**d)
-        strategy: "uniform"、"random"、"lhs"、"halton"、"sobol"、"hammersley"
-        seed: 随机种子 (仅对 "random"/"lhs"/"halton"/"sobol" 有效)
-        scramble: 是否对 Halton 或 Sobol 做 scramble
-
-    Returns:
-        pts: NumPy 数组，shape = (n_pts**d, d)，每行是一个 d 维采样坐标。
+    strategy 现支持:
+      "grid"      – 规则网格 n_pts^d
+      "uniform"   – 随机均匀分布
+      "lhs"       – Latin Hypercube
+      "halton"    – Halton 低差序列
+      "sobol"     – Sobol 低差序列 (自动补 2^m 长度再截断)
+      "hammersley"– 只做 2D 的 Hammersley
     """
-    # 1) 先把 domain 规范成列表 [(lo,hi), (lo,hi), ...] 形式
+    # -------- 1) 把 domain 规范成 [(lo,hi), ...] --------
     if isinstance(domain, tuple) and isinstance(domain[0], jnp.ndarray):
-        # numpy/jax 数组版，直接把单项归为列表
         lo_arr, hi_arr = domain
         lo_arr = jnp.asarray(lo_arr)
         hi_arr = jnp.asarray(hi_arr)
-        assert lo_arr.shape == hi_arr.shape, "domain 两个数组必须同形状 (d,)"
-        d = lo_arr.shape[0]
-        domain_list = [(float(lo_arr[i]), float(hi_arr[i])) for i in range(d)]
+        assert lo_arr.shape == hi_arr.shape
+        domain_list = [(float(lo_arr[i]), float(hi_arr[i])) for i in range(lo_arr.shape[0])]
     elif isinstance(domain[0], (float, int, np.floating)):
-        # domain=(xmin,xmax) 1D
-        domain_list = [(float(domain[0]), float(domain[1]))]
+        domain_list = [(float(domain[0]), float(domain[1]))]     # 1-D
     else:
-        # domain 已经是 list-of-tuples 形式
-        domain_list = list(domain)
-        d = len(domain_list)
-
+        domain_list = list(domain)                               # 已是 list[(lo,hi)]
+    #print("domain_list",domain_list)
     d = len(domain_list)
     N = n_pts ** d
 
     rng = np.random.default_rng(seed)
     stg = strategy.lower()
 
-    if stg == "uniform":
-        # 每维 n_pts 均匀节点 → meshgrid → 展平
+    # -------- 2) 逐策略采样 --------
+    if stg == "grid":
         axes = [np.linspace(lo, hi, n_pts) for lo, hi in domain_list]
         mesh = np.meshgrid(*axes, indexing="ij")
-        pts = np.column_stack([m.ravel() for m in mesh])
+        pts  = np.column_stack([m.ravel() for m in mesh])        # (n_pts^d, d)
 
-    elif stg == "random":
+    elif stg == "uniform":
         samples_01 = rng.random((N, d))
         pts = _scale_sample(samples_01, domain_list)
 
@@ -142,7 +174,7 @@ def generate_collocation(
 
     elif stg == "hammersley":
         if d != 2:
-            raise NotImplementedError("Hammersley 仅支持 2D。")
+            raise NotImplementedError("Hammersley 仅支持 2D")
         pts_01 = np.zeros((N, 2))
         for i in range(N):
             pts_01[i, 0] = i / N
@@ -150,45 +182,84 @@ def generate_collocation(
         pts = _scale_sample(pts_01, domain_list)
 
     else:
-        raise ValueError(
-            f"Unknown strategy='{strategy}'. "
-            "请从 ['uniform','random','lhs','halton','sobol','hammersley'] 中选择。"
-        )
+        raise ValueError(f"Unknown strategy='{strategy}'. 请选择其中之一: "
+                         "['grid','uniform','random','lhs','halton','sobol','hammersley'].")
 
     return pts
 
 
 # =================== 测试 & 可视化 =================== #
 if __name__ == "__main__":
-    # ---------- 测试 generate_subdomains ----------
-    domain_1d = (jnp.array([0.0]), jnp.array([1.0]))  # 1D
-    subs_1d = generate_subdomains(domain_1d, n_sub_per_dim=4, overlap=0.2)
-    print("1D 子域数量:", len(subs_1d), "示例：", subs_1d[:2])
-
-    domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))  # 2D
-    subs_2d = generate_subdomains(domain_2d, n_sub_per_dim=[3, 2], overlap=0.1)
-    print("2D 子域数量:", len(subs_2d), "示例：", subs_2d[:2])
-
-    # ---------- 测试 generate_collocation ----------
-    # 1D 情况
-    pts1d = generate_collocation((jnp.array([0.0]), jnp.array([1.0])), n_pts=5, strategy="uniform")
-    print("1D 均匀 5 点, 形状:", pts1d.shape, pts1d[:5])
-
-    # 2D 情况：数组形式
-    pts2d_arr = generate_collocation((jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0])), n_pts=5, strategy="uniform")
-    print("2D 数组域 均匀 5×5, 形状:", pts2d_arr.shape, pts2d_arr[:5])
-
-    # 2D 情况：列表形式
-    pts2d_list = generate_collocation([(0.0, 0.0), (1.0, 1.0)], n_pts=5, strategy="random", seed=42)
-    print("2D 列表域 随机 5×5, 形状:", pts2d_list.shape, pts2d_list[:5])
-
-    # 可视化对比（任选一种）
     import matplotlib.pyplot as plt
+
+    # ------------------------------------------------------------
+    # 1. generate_subdomains 回归 + 新功能测试
+    # ------------------------------------------------------------
+    print("===== generate_subdomains =====")
+
+    # --- 1D：旧接口（n_sub_per_dim）
+    domain_1d = (jnp.array([0.0]), jnp.array([1.0]))
+    subs_1d = generate_subdomains(domain_1d,
+                                  n_sub_per_dim=4,
+                                  overlap=0.2)
+    print("1D 均匀 4 子域:", len(subs_1d), subs_1d[:3], "...\n")
+
+    # --- 1D：新接口（自定义中心）
+    centers_1d = jnp.array([0.1, 0.4, 0.7, 0.95])
+    subs_1d_custom = generate_subdomains(domain_1d,
+                                         overlap=0.05,
+                                         centers_per_dim=[centers_1d],
+                                         widths_per_dim=[0.15])
+    print("1D 自定义中心 4 子域:", len(subs_1d_custom), subs_1d_custom[:3], "...\n")
+
+    # --- 2D：旧接口（均匀 5×5）
+    domain_2d = (jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0]))
+    subs_2d = generate_subdomains(domain_2d,
+                                  n_sub_per_dim=[5, 5],
+                                  overlap=0.1)
+    print("2D 均匀 5×5 子域:", len(subs_2d), subs_2d[:3], "...\n")
+
+    # --- 2D：新接口（6×8 峰 + 4 条贴边子域）
+    x_centers = (jnp.arange(8) + 0.0) / 7.0             # 包含边界中心 0, 1
+    y_centers = (jnp.arange(10) + 0.0) / 9.0
+    widths_x  = jnp.array([1/6] + [2/6]*6 + [1/6])      # 贴边子域窄一些
+    widths_y  = jnp.array([1/8] + [2/8]*8 + [1/8])
+    subs_2d_custom = generate_subdomains(domain_2d,
+                                         overlap=0.0,
+                                         centers_per_dim=[x_centers, y_centers],
+                                         widths_per_dim=[widths_x, widths_y])
+    print("2D 自定义中心 + 宽度 子域:", len(subs_2d_custom),
+          subs_2d_custom[:3], "...\n")
+
+    # ------------------------------------------------------------
+    # 2. generate_collocation 回归测试
+    # ------------------------------------------------------------
+    print("===== generate_collocation =====")
+
+    # --- 1D, uniform
+    pts1d = generate_collocation(domain_1d,
+                                 n_pts=5,
+                                 strategy="uniform")
+    print("1D uniform 5 点:", pts1d.shape, pts1d)
+
+    # --- 2D, grid
+    pts2d = generate_collocation(domain_2d,
+                                 n_pts=5,
+                                 strategy="grid")
+    print("2D grid 5×5 点:", pts2d.shape, "\n")
+
+    # ------------------------------------------------------------
+    # 3. 可视化不同 collocation strategy
+    # ------------------------------------------------------------
+    strategies = ["uniform", "grid", "lhs", "halton", "sobol", "hammersley"]
     fig, axes = plt.subplots(2, 3, figsize=(12, 8), sharex=True, sharey=True)
-    strategies = ["uniform", "random", "lhs", "halton", "sobol", "hammersley"]
     for ax, stg in zip(axes.flat, strategies):
-        pts = generate_collocation((jnp.array([0.0, 0.0]), jnp.array([1.0, 1.0])), n_pts=8, strategy=stg, seed=42)
-        ax.scatter(pts[:, 0], pts[:, 1], s=20, alpha=0.7, edgecolors='k')
+        pts = generate_collocation(domain_2d,
+                                   n_pts=8,
+                                   strategy=stg,
+                                   seed=42)
+        ax.scatter(pts[:, 0], pts[:, 1], s=20, alpha=0.7,
+                   edgecolors="k")
         ax.set_title(stg.capitalize())
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)

@@ -84,6 +84,6 @@ class PINN(eqx.Module):
         # 如果 out_size==1，就 squeeze 掉最后一维
         if self.out_dim == 1:
             nn_out = nn_out[:, 0]  # shape = (batch,)
-
+        nn_out = nn_out/15.0
         # 把原始的 x（可能是 (N,) 或 (2,)）连同 nn_out 一起传给 ansatz
         return self.ansatz(x, nn_out)
