@@ -4,7 +4,7 @@
 
 # Ignore Jupyter checkpoint files
 .ipynb_checkpoints/
-
+.ipynb/
 # Ignore virtual environment
 venv/
 
