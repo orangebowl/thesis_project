@@ -9,17 +9,11 @@
 venv/
 
 # Ignore files
-baseline_ansatz_compare
-baseline_ansatz
-example1_fbpinns
-example1_pinns
-main_cosine
-main_pou
-pipeline_test
-pou
-pipeline
-pou_rad_freeze
-
+Hexagon_FBPINN
+test
+Complex_shaped_ADF
+complex_shaped_test
+MLP-POU-2D-RAD-complex
 # Ignore outputs
 outputs
 visualizations

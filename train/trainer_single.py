@@ -2,168 +2,176 @@ import jax
 import jax.numpy as jnp
 import optax
 import equinox as eqx
-import os,sys
+from typing import Callable, Optional, Dict, Any, Tuple
+from tqdm import trange
+from pathlib import Path
 import matplotlib.pyplot as plt
-from tqdm import trange  # For progress bar
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Function to compute loss for a mini-batch of points
-def loss_fn(model, x_collocation, pde_residual):
-    return pde_residual(model, x_collocation)
+def _save_colloc_snapshot(colloc: jax.Array, domain: Tuple[jax.Array, jax.Array], out_dir: str, tag: str) -> None:
+    """Optionally save a scatter plot of the current collocation set (1D/2D)."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    colloc = jnp.asarray(colloc)
+    plt.figure(figsize=(6, 4))
+
+    if colloc.shape[1] == 1:
+        x = colloc.squeeze()
+        plt.scatter(x, jnp.zeros_like(x), s=3, alpha=0.5)
+        plt.yticks([])
+        plt.xlabel("x")
+        plt.xlim(float(domain[0][0]), float(domain[1][0]))
+    elif colloc.shape[1] == 2:
+        plt.scatter(colloc[:, 0], colloc[:, 1], s=3, alpha=0.5)
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.xlim(float(domain[0][0]), float(domain[1][0]))
+        plt.ylim(float(domain[0][1]), float(domain[1][1]))
+    else:
+        plt.close()
+        return
+
+    plt.title(f"RAD collocation after {tag} (N={colloc.shape[0]})")
+    plt.tight_layout()
+    plt.savefig(Path(out_dir) / f"rad_{tag}.png", dpi=160)
+    plt.close()
+
 
 @eqx.filter_jit
-def train_step_single(model, opt_state, x_collocation, optimizer, pde_residual):
-    """Perform a single training step for the PINN."""
-    loss_val, grads = eqx.filter_value_and_grad(loss_fn)(model, x_collocation, pde_residual)
-    updates, opt_state = optimizer.update(grads, opt_state, model)
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss_val
+def pointwise_residual(problem, params, static, x: jax.Array) -> jax.Array:
+    """Return per-sample |r(x)| with shape (N,)."""
+    model = eqx.combine(params, static)
 
-@eqx.filter_jit
-def compute_l1(model, x_test, u_test_exact):
-    """Compute L1 error on the test set."""
-    pred = jax.vmap(model)(x_test).squeeze()
-    return jnp.mean(jnp.abs(pred - u_test_exact.squeeze()))
+    def _one(xi):
+        # residual expects a batch; add batch dim and take sqrt to get magnitude
+        return jnp.sqrt(problem.residual(model, xi[None, ...]))
 
-def train_single(
-    model,
-    colloc,
-    lr,
-    steps,
-    pde_residual,
-    batch_size,
-    x_test=None,
-    u_exact=None,
-    save_dir=None,
-    checkpoint_every=0,
-):
-    optimizer = optax.adam(lr)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-
-    # Shuffle collocation points to create random mini-batches
-    num_batches = len(colloc) // batch_size
-    if num_batches == 0:
-        raise ValueError("Batch size is larger than the number of collocation points.")
-
-    # Tracking loss and L1 errors
-    loss_list = []
-    l1_list = []
-    loss_hist = []
-    l1_hist = []
-    l1_steps = []  # Steps where L1 error is computed
-    pbar = trange(steps, desc="PINN", dynamic_ncols=True)
-
-    for i in pbar:
-        # Shuffle indices for mini-batches
-        shuffled_indices = jax.random.permutation(jax.random.PRNGKey(i), len(colloc))
-        for batch_idx in range(num_batches):
-            # Get mini-batch of collocation points
-            batch_indices = shuffled_indices[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-            x_batch = colloc[batch_indices]
-
-            # Perform one training step
-            model, opt_state, loss_val = train_step_single(model, opt_state, x_batch, optimizer, pde_residual)
-
-            loss_list.append(loss_val)
-
-            # Calculate test L1 error at intervals
-            eval_every = 100            # 每 100 个外层 step 评一次
-            if x_test is not None and u_exact is not None and (i % eval_every == 0 or i == steps - 1):
-                u_test_exact = u_exact(x_test)
-                l1_error = float(compute_l1(model, x_test, u_test_exact))
-                l1_list.append(l1_error)
-                l1_steps.append(i)  # Save the current step for L1 calculation
-
-                pbar.set_postfix(loss=f"{loss_val:.2e}", l1=f"{l1_error:.2e}")
-            else:
-                # Ensure we don't update l1_list when no L1 error is computed
-                continue
-
-        loss_hist.append(loss_list[-1])  # Record the last loss value
-        #l1_hist.append(l1_list[-1])  # Record the last L1 error value
-        if l1_list:                        # ← 新增保护
-            l1_hist.append(l1_list[-1])    # 只有在真的算过 L1 时才记录
-
-        # Save checkpoint
-        if checkpoint_every and save_dir and (i + 1) % checkpoint_every == 0:
-            os.makedirs(save_dir, exist_ok=True)
-            eqx.tree_serialise_leaves(
-                os.path.join(save_dir, f"ckpt_{i+1}.eqx"), model
-            )
-
-    # Ensure `t_steps` and `t_l1` are always aligned
-    t_steps = jnp.array(l1_steps)
-    t_l1 = jnp.array(l1_list)
-
-    # Check if `t_steps` and `t_l1` lengths match
-    if len(t_steps) != len(t_l1):
-        raise ValueError(f"Mismatch in lengths of t_steps and t_l1. t_steps: {len(t_steps)}, t_l1: {len(t_l1)}")
-
-    return model, jnp.array(loss_hist), (t_steps, t_l1)
+    return jax.vmap(_one)(x).reshape(-1)
 
 
+def rad_sample(
+    *,
+    key: jax.random.PRNGKey,
+    problem,
+    params,
+    static,
+    domain: Tuple[jax.Array, jax.Array],
+    n_draw: int,
+    pool_size: int,
+    k: float = 1.0,
+    c: float = 1.0,
+) -> jax.Array:
+    """Residual-based Adaptive Sampling (RAD)."""
+    lo, hi = jnp.asarray(domain[0]), jnp.asarray(domain[1])
+    dim = lo.size
+
+    # candidate pool
+    pool = jax.random.uniform(key, (pool_size, dim), minval=lo, maxval=hi)
+
+    # weights from residuals
+    r = pointwise_residual(problem, params, static, pool)  # (pool_size,)
+    rpk = r**k
+    w = rpk / (jnp.mean(rpk) + 1e-12) + c
+    prob = w / (jnp.sum(w) + 1e-12)
+
+    choices = jnp.arange(pool_size)
+    if n_draw >= pool_size:
+        idx = jax.random.permutation(key, choices)[:n_draw]
+    else:
+        idx = jax.random.choice(key, choices, shape=(n_draw,), p=prob, replace=False)
+    return pool[idx]
 
 
+def train_pinn(
+    *,
+    key: jax.random.PRNGKey,
+    model: eqx.Module,
+    problem,
+    colloc: jax.Array,
+    lr: float = 3e-4,
+    steps: int = 10_000,
+    x_test: Optional[jax.Array] = None,
+    u_exact: Optional[Callable[[jax.Array], jax.Array]] = None,
+    rad_cfg: Optional[Dict[str, Any]] = None,
+    eval_every: int = 100,
+) -> Tuple[eqx.Module, jax.Array, Tuple[jax.Array, jax.Array]]:
+    """
+    Full-batch PINN trainer. Tracks PDE loss and relative L2 error on x_test/u_exact.
+    Returns (trained_model, loss_history, (eval_steps, rel_l2_history)).
+    """
+    colloc = colloc.astype(jnp.float32)
+    params, static = eqx.partition(model, eqx.is_array)
+    build_model = lambda p: eqx.combine(p, static)
+    loss_fn = lambda p, xy: problem.residual(build_model(p), xy)
 
-# Test 
-if __name__ == "__main__":
-    import os,sys
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    from model.pinn_model import PINN
-    from physics.pde_cosine import u_exact, pde_residual_loss, ansatz
-    import jax.random as jr
+    @eqx.filter_jit
+    def eval_fn(p):
+        if x_test is None or u_exact is None:
+            return jnp.nan
+        pred_raw = build_model(p)(x_test.astype(jnp.float32))
+        exact_raw = u_exact(x_test)
+        pred_vec = pred_raw.ravel()
+        exact_vec = exact_raw.ravel()
+        if pred_vec.shape != exact_vec.shape:
+            return jnp.nan
+        err = jnp.linalg.norm(pred_vec - exact_vec)
+        den = jnp.linalg.norm(exact_vec)
+        return err / (den + 1e-8)
 
-    save_dir = "outputs/single_pinn_cosine_15"
-    os.makedirs(save_dir, exist_ok=True)
+    opt = optax.adam(lr)
+    opt_state = opt.init(params)
 
-    key = jr.PRNGKey(0)
-    model = PINN(key, ansatz)
+    @eqx.filter_jit
+    def step_fn(p, o, xy_batch):
+        xy_batch = xy_batch.reshape(-1, xy_batch.shape[-1])
+        loss, grads = jax.value_and_grad(loss_fn)(p, xy_batch)
+        updates, o = opt.update(grads, o, p)
+        p = eqx.apply_updates(p, updates)
+        return p, o, loss
 
-    x_collocation = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 200)
-    x_test = jnp.linspace(-2 * jnp.pi, 2 * jnp.pi, 200)
+    # ahead-of-time compile
+    _ = step_fn(params, opt_state, colloc[:1])
 
-    # 训练
-    model, train_loss, test_l1 = train_single(
-        model,
-        x_collocation,
-        lr=1e-3,
-        steps=5000,
-        pde_residual=pde_residual_loss,
-        x_test=x_test,
-        u_exact=u_exact,
-    )
+    use_rad = rad_cfg is not None
+    if use_rad:
+        resample_every = int(rad_cfg.get("resample_every", 1000))
+        pool_size = int(rad_cfg.get("pool_size", 10000))
+        k = float(rad_cfg.get("k", 1.0))
+        c = float(rad_cfg.get("c", 1.0))
+        viz_dir = rad_cfg.get("viz_dir", None)
+        viz_every = int(rad_cfg.get("viz_every", 1))
+        print(f"[RAD] Resampling every {resample_every} steps (pool={pool_size}, k={k}, c={c})")
 
-    eqx.tree_serialise_leaves(os.path.join(save_dir, "final_model.eqx"), model)
+    loss_hist, rel_l2_hist, eval_steps = [], [], []
+    bar = trange(steps, dynamic_ncols=True, desc="PINN Training")
 
-    jnp.save(os.path.join(save_dir, "train_loss.npy"), train_loss)
-    jnp.save(os.path.join(save_dir, "test_l1.npy"), test_l1)
+    for s in bar:
+        if use_rad and (s % resample_every == 0) and s > 0:
+            key, k_rad = jax.random.split(key)
+            colloc = rad_sample(
+                key=k_rad,
+                problem=problem,
+                params=params,
+                static=static,
+                domain=problem.domain,
+                n_draw=colloc.shape[0],
+                pool_size=pool_size,
+                k=k,
+                c=c,
+            ).astype(jnp.float32)
 
-    u_pred = jax.vmap(model)(x_test)
-    u_true = u_exact(x_test)
+            if viz_dir and ((s // resample_every) % viz_every == 0):
+                _save_colloc_snapshot(colloc, problem.domain, viz_dir, f"step{s}")
 
-    plt.figure()
-    plt.plot(x_test, u_true, "--", label="Exact")
-    plt.plot(x_test, u_pred, label="PINN Pred")
-    plt.title("PINN Prediction vs Exact")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "prediction_vs_exact.png"), dpi=300)
+        params, opt_state, loss_val = step_fn(params, opt_state, colloc)
+        loss_hist.append(float(loss_val))
 
-    # visulize training loss & L1 test loss
-    plt.figure()
-    plt.plot(train_loss)
-    plt.yscale("log")
-    plt.title("Training Loss Curve")
-    plt.xlabel("Steps")
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "loss_curve.png"), dpi=300)
+        if ((s + 1) % eval_every == 0) or (s + 1 == steps):
+            rel_l2 = float(eval_fn(params))
+            rel_l2_hist.append(rel_l2)
+            eval_steps.append(s + 1)
+            bar.set_postfix(loss=f"{loss_val:.3e}", RelL2=f"{rel_l2:.3e}")
+        else:
+            bar.set_postfix(loss=f"{loss_val:.3e}")
 
-    plt.figure()
-    plt.plot(test_l1)
-    plt.yscale("log")  
-    plt.title("Test L1 Curve")
-    plt.xlabel("Steps")
-    plt.grid(True)
-    plt.savefig(os.path.join(save_dir, "test_l1_curve.png"), dpi=300)
-    print("", save_dir)
+    return build_model(params), jnp.asarray(loss_hist), (jnp.asarray(eval_steps), jnp.asarray(rel_l2_hist))
