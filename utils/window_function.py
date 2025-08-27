@@ -154,10 +154,6 @@ def sigmoid(xmins_all, xmaxs_all,
 
 
 
-##############################################################################
-# 2) 通用的 1D/2D 绘图函数
-##############################################################################
-
 def plot_window_weights_1d(window_func, domain_bounds, subdomains,
                            transition, n_points=300, tol_plot=1e-3):
     """

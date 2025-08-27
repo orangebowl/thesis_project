@@ -18,6 +18,7 @@ main_pou
 pipeline_test
 pou
 pipeline
+pou_rad_freeze
 
 # Ignore outputs
 outputs
@@ -29,6 +30,7 @@ pou_fbpinn_results
 thesis_results
 results
 notebook
+
 # Ignore VSCode settings
 .vscode/
 
